@@ -9,6 +9,9 @@ from typing import Any, Iterable, Mapping
 from qa_engine import parse_decision, validate_rules
 
 
+AUTOMATIC_RULE_SOURCE = "automatic_pattern_learning"
+
+
 def _suggestion_id(parts: Iterable[str]) -> str:
     payload = "\x1f".join(parts).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()[:16]
@@ -71,7 +74,7 @@ def build_pattern_suggestions(
                 "original": term,
                 "proposed": "*",
                 "status": "rejected",
-                "comment": "Human reviewers confirmed this is a valid term.",
+                "comment": "Valid curriculum or technical term.",
                 "evidence_count": len(evidence),
                 "reports": ", ".join(sorted({item["report_name"] for item in evidence})),
             }
@@ -174,7 +177,7 @@ def build_shared_pattern_suggestions(
                 "original": term,
                 "proposed": "*",
                 "status": "rejected",
-                "comment": "Human reviewers confirmed this is a valid term.",
+                "comment": "Valid curriculum or technical term.",
                 **evidence_totals(items),
             }
         )
@@ -204,6 +207,127 @@ def build_shared_pattern_suggestions(
             str(item["original"]).lower(),
         ),
     )
+
+
+def automatic_suggestion_reason(suggestion: Mapping[str, Any]) -> str | None:
+    """Return why a consensus pattern is safe to promote without an editor."""
+    status = str(suggestion.get("status") or "")
+    if status not in {"approved", "rejected"}:
+        return None
+
+    suggestion_type = str(suggestion.get("suggestion_type") or "")
+    checker = str(suggestion.get("checker") or "")
+    comment = str(suggestion.get("comment") or "").casefold()
+    human_decisions = int(suggestion.get("evidence_count") or 0)
+    human_reports = int(suggestion.get("human_reports") or 0)
+    course_coverage = int(suggestion.get("course_coverage") or 0)
+    occurrences = int(suggestion.get("occurrences") or 0)
+
+    if (
+        suggestion_type == "protected spelling term"
+        and status == "rejected"
+        and human_decisions >= 1
+        and course_coverage >= 2
+        and occurrences >= 2
+    ):
+        return "Confirmed valid term recurring across courses."
+
+    if suggestion_type != "exact rule":
+        return None
+
+    if checker == "check_math" and status == "rejected" and human_decisions >= 1:
+        return "Confirmed math-checker false positive."
+
+    if (
+        checker == "check_spacing"
+        and human_decisions >= 2
+        and human_reports >= 2
+        and course_coverage >= 2
+    ):
+        return "Consistent spacing decision across reviewed courses."
+
+    if (
+        checker == "check_capitalization"
+        and status == "rejected"
+        and human_decisions >= 2
+        and human_reports >= 2
+        and course_coverage >= 2
+        and any(
+            signal in comment
+            for signal in ("math", "notation", "constant", "standard", "lowercase")
+        )
+    ):
+        return "Consistent math or standards notation across reviewed courses."
+
+    if (
+        checker == "check_spelling"
+        and human_decisions >= 2
+        and human_reports >= 2
+        and course_coverage >= 2
+    ):
+        return "Consistent spelling decision across reviewed courses."
+
+    return None
+
+
+def automatic_suggestions(
+    suggestions: Iterable[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Select consensus patterns that meet the conservative automation policy."""
+    selected: list[dict[str, Any]] = []
+    for source in suggestions:
+        reason = automatic_suggestion_reason(source)
+        if not reason:
+            continue
+        suggestion = dict(source)
+        suggestion["selected"] = True
+        suggestion["source"] = AUTOMATIC_RULE_SOURCE
+        suggestion["automation_reason"] = reason
+        selected.append(suggestion)
+    return selected
+
+
+def _suggestion_is_covered(
+    rules: Mapping[str, Any], suggestion: Mapping[str, Any]
+) -> bool:
+    if suggestion.get("suggestion_type") == "protected spelling term":
+        term = str(suggestion.get("original") or "").strip().casefold()
+        return term in set(rules.get("protected_spelling_terms", []))
+    signature = (
+        suggestion.get("checker", "*"),
+        suggestion.get("field", "*"),
+        suggestion.get("original", "*"),
+        suggestion.get("proposed", "*"),
+        suggestion.get("status"),
+        suggestion.get("comment", ""),
+    )
+    return signature in {
+        (
+            rule.get("checker", "*"),
+            rule.get("field", "*"),
+            rule.get("original", "*"),
+            rule.get("proposed", "*"),
+            rule.get("status"),
+            rule.get("comment", ""),
+        )
+        for rule in rules.get("exact_rules", [])
+    }
+
+
+def promote_automatic_suggestions(
+    rules: Mapping[str, Any],
+    suggestions: Iterable[Mapping[str, Any]],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Promote newly qualified patterns and return the rules that were added."""
+    normalized_rules = validate_rules(rules)
+    promoted = [
+        suggestion
+        for suggestion in automatic_suggestions(suggestions)
+        if not _suggestion_is_covered(normalized_rules, suggestion)
+    ]
+    if not promoted:
+        return normalized_rules, []
+    return promote_suggestions(normalized_rules, promoted), promoted
 
 
 def promote_suggestions(
@@ -248,7 +372,7 @@ def promote_suggestions(
                 "proposed": signature[3],
                 "status": signature[4],
                 "comment": signature[5],
-                "source": "human_feedback",
+                "source": str(suggestion.get("source") or "human_feedback"),
             }
         )
         exact_signatures.add(signature)

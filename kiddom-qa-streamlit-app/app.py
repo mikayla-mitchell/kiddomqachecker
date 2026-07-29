@@ -49,6 +49,8 @@ from jira_integration import (
     is_html_attachment,
 )
 from pattern_learning import (
+    AUTOMATIC_RULE_SOURCE,
+    automatic_suggestions,
     build_shared_pattern_suggestions,
     promote_suggestions,
 )
@@ -408,6 +410,70 @@ def reclassify_loaded_reports() -> None:
         report["rows"] = classify_records(report["records"], st.session_state.rules)
 
 
+def rules_without_automatic_layer() -> tuple[dict, int]:
+    rules = load_rules(st.session_state.rules)
+    previous_terms = set(
+        st.session_state.get("automatic_protected_terms", [])
+    )
+    rules["protected_spelling_terms"] = [
+        term
+        for term in rules["protected_spelling_terms"]
+        if term not in previous_terms
+    ]
+    previous_exact_count = len(rules["exact_rules"])
+    rules["exact_rules"] = [
+        rule
+        for rule in rules["exact_rules"]
+        if rule.get("source") != AUTOMATIC_RULE_SOURCE
+    ]
+    removed = (
+        previous_exact_count - len(rules["exact_rules"]) + len(previous_terms)
+    )
+    return rules, removed
+
+
+def refresh_automatic_learning() -> dict[str, object]:
+    """Rebuild the safe automatic rule layer from shared consensus evidence."""
+    if st.session_state.memory_error:
+        return {"active": [], "new": [], "removed": 0}
+
+    rules_without_automatic, removed = rules_without_automatic_layer()
+
+    suggestions = build_shared_pattern_suggestions(
+        shared_pattern_evidence(MEMORY_PATH),
+        rules_without_automatic,
+    )
+    active = automatic_suggestions(suggestions)
+    previous_ids = set(st.session_state.get("automatic_rule_ids", []))
+    active_ids = {str(suggestion["suggestion_id"]) for suggestion in active}
+    newly_qualified = [
+        suggestion
+        for suggestion in active
+        if str(suggestion["suggestion_id"]) not in previous_ids
+    ]
+
+    st.session_state.rules = (
+        promote_suggestions(rules_without_automatic, active)
+        if active
+        else load_rules(rules_without_automatic)
+    )
+    st.session_state.automatic_rule_ids = sorted(active_ids)
+    st.session_state.automatic_protected_terms = sorted(
+        {
+            str(suggestion.get("original") or "").strip().casefold()
+            for suggestion in active
+            if suggestion.get("suggestion_type") == "protected spelling term"
+        }
+    )
+    st.session_state.automatic_learning_active = active
+    reclassify_loaded_reports()
+    return {
+        "active": active,
+        "new": newly_qualified,
+        "removed": removed,
+    }
+
+
 def seed_reviews_from_memory(report: dict) -> dict[str, int]:
     if st.session_state.memory_error:
         return {"reused": 0, "exact": 0, "near": 0}
@@ -545,11 +611,21 @@ def add_report_payload(
                 f"{library_error}; " if library_error else ""
             ) + f"Jira link was not saved: {error}"
     st.session_state.reports[report_id] = loaded_report
+    learning_result = refresh_automatic_learning()
+    loaded_report["reviews"] = {
+        str(row["issue_id"]): loaded_report["reviews"].get(
+            str(row["issue_id"]),
+            {"decision": "", "review_note": ""},
+        )
+        for row in loaded_report["rows"]
+        if row["status"] == "needs_change"
+    }
     memory_result = seed_reviews_from_memory(loaded_report)
     st.session_state.selected_report = report_id
     return {
         "report": loaded_report,
         "memory": memory_result,
+        "automatic_rules_learned": len(learning_result["new"]),
         "stored_findings": stored_findings,
         "library_saved": library_saved,
         "library_error": library_error,
@@ -1057,6 +1133,9 @@ def render_jira_workspace(
                     **result["memory"],
                     "reports": int(result["library_saved"]),
                     "findings": result["stored_findings"],
+                    "automatic_rules_learned": result[
+                        "automatic_rules_learned"
+                    ],
                 }
                 if result["library_error"]:
                     st.session_state.jira_load_warning = result["library_error"]
@@ -1252,6 +1331,9 @@ def render_jira_handoff(
 
 current_user = enforce_google_workspace_login()
 initialize_state(current_user)
+if not st.session_state.get("automatic_learning_initialized"):
+    refresh_automatic_learning()
+    st.session_state.automatic_learning_initialized = True
 jira_config, jira_config_error = jira_configuration()
 
 st.markdown('<div class="qa-kicker">Curriculum quality operations</div>', unsafe_allow_html=True)
@@ -1308,7 +1390,11 @@ with st.sidebar:
 
     if process_clicked and uploads:
         memory_reuse_total = {"reused": 0, "exact": 0, "near": 0}
-        library_total = {"reports": 0, "findings": 0}
+        library_total = {
+            "reports": 0,
+            "findings": 0,
+            "automatic_rules_learned": 0,
+        }
         for upload in uploads:
             payload = upload.getvalue()
             with st.spinner(f"Reading {upload.name}…"):
@@ -1327,6 +1413,9 @@ with st.sidebar:
                 memory_reuse_total[result_key] += memory_result[result_key]
             library_total["reports"] += int(result["library_saved"])
             library_total["findings"] += result["stored_findings"]
+            library_total["automatic_rules_learned"] += result[
+                "automatic_rules_learned"
+            ]
             del payload
         st.session_state.upload_generation += 1
         st.session_state.processing_flash = {
@@ -1382,15 +1471,21 @@ with st.sidebar:
     ):
         try:
             st.session_state.rules = load_rules(custom_rules.getvalue())
-            reclassify_loaded_reports()
-            st.success("Rulebook loaded and reports reclassified.")
+            learning_result = refresh_automatic_learning()
+            st.success(
+                "Rulebook loaded, safe shared patterns reapplied, and reports "
+                f"reclassified ({len(learning_result['active']):,} automatic rules)."
+            )
             st.rerun()
         except (QAEngineError, ValueError) as error:
             st.error(str(error))
     if st.button("Reset to bundled rules", width="stretch"):
         st.session_state.rules = load_rules(BASE_RULES_PATH)
-        reclassify_loaded_reports()
-        st.success("Bundled rules restored.")
+        learning_result = refresh_automatic_learning()
+        st.success(
+            "Bundled rules restored and safe shared patterns reapplied "
+            f"({len(learning_result['active']):,} automatic rules)."
+        )
         st.rerun()
 
     st.divider()
@@ -1410,17 +1505,25 @@ if processing_flash is not None:
         if processing_flash.get("reports", 0)
         else ""
     )
+    learned_message = (
+        f" Learned {processing_flash['automatic_rules_learned']:,} new "
+        "automatic rule"
+        f"{'s' if processing_flash['automatic_rules_learned'] != 1 else ''}."
+        if processing_flash.get("automatic_rules_learned")
+        else ""
+    )
     if processing_flash["reused"]:
         st.toast(
             "Processing complete — "
             f"{processing_flash['reused']:,} prior decisions reused "
             f"({processing_flash['exact']:,} exact, "
-            f"{processing_flash['near']:,} near).{stored_message}",
+            f"{processing_flash['near']:,} near).{stored_message}{learned_message}",
             icon="♻️",
         )
     else:
         st.toast(
-            f"Processing complete. No prior decisions matched.{stored_message}",
+            "Processing complete. No prior decisions matched."
+            f"{stored_message}{learned_message}",
             icon="✅",
         )
 
@@ -1509,16 +1612,23 @@ counts = status_counts(merged_rows)
 completed, flagged_total = review_progress(report["rows"], report["reviews"])
 outstanding = flagged_total - completed
 
-metric_cols = st.columns(6)
+automatically_handled = sum(
+    row.get("status") in {"approved", "rejected"} for row in report["rows"]
+)
+metric_cols = st.columns(7)
 metric_cols[0].metric("Findings", f"{len(report['rows']):,}")
 metric_cols[1].metric("Approved", f"{counts.get('approved', 0):,}")
 metric_cols[2].metric("Rejected", f"{counts.get('rejected', 0):,}")
 metric_cols[3].metric("Needs change", f"{counts.get('needs_change', 0):,}")
 metric_cols[4].metric(
+    "Automatically handled",
+    f"{automatically_handled:,}",
+)
+metric_cols[5].metric(
     "Reused decisions",
     f"{sum(bool(review.get('memory_match')) for review in report['reviews'].values()):,}",
 )
-metric_cols[5].metric("Review remaining", f"{outstanding:,}")
+metric_cols[6].metric("Review remaining", f"{outstanding:,}")
 
 page = st.radio(
     "Workspace",
@@ -1540,6 +1650,28 @@ if page == "Review report":
     )
 
     with overview_tab:
+        automatic_math = sum(
+            row["checker"] == "check_math"
+            and row["status"] in {"approved", "rejected"}
+            for row in report["rows"]
+        )
+        automatic_standards = sum(
+            row["checker"] == "check_spacing"
+            and row["status"] == "rejected"
+            and "standards code" in str(row.get("comment") or "").casefold()
+            for row in report["rows"]
+        )
+        automatic_spacing = sum(
+            row["checker"] == "check_spacing"
+            and row["status"] in {"approved", "rejected"}
+            for row in report["rows"]
+        ) - automatic_standards
+        if automatic_math or automatic_standards or automatic_spacing:
+            st.success(
+                "Recognized rules handled these findings without reviewer edits: "
+                f"{automatic_math:,} math, {automatic_standards:,} standards, "
+                f"and {automatic_spacing:,} spacing."
+            )
         reused_reviews = [
             review
             for review in report["reviews"].values()
@@ -1917,10 +2049,12 @@ if page == "Review report":
                 ],
                 current_user,
             )
+            learning_result = refresh_automatic_learning()
             newly_seeded = seed_all_loaded_reports()
             st.session_state.memory_publish_flash = {
                 **result,
                 "newly_seeded": newly_seeded["reused"],
+                "automatic_rules_learned": len(learning_result["new"]),
             }
             st.rerun()
         if outstanding:
@@ -1947,6 +2081,12 @@ if page == "Review report":
                 message += (
                     f" Prefilled {publish_flash['newly_seeded']:,} blank reviews "
                     "in other loaded reports."
+                )
+            if publish_flash["automatic_rules_learned"]:
+                message += (
+                    f" Learned {publish_flash['automatic_rules_learned']:,} new "
+                    "automatic rule"
+                    f"{'s' if publish_flash['automatic_rules_learned'] != 1 else ''}."
                 )
             st.success(message)
 
@@ -2182,12 +2322,14 @@ elif page == "Decision Memory":
                     result = import_memory_bytes(
                         MEMORY_PATH, memory_upload.getvalue()
                     )
+                    learning_result = refresh_automatic_learning()
                     seeded = seed_all_loaded_reports()
                     st.success(
                         f"Imported {result['reports']:,} reports, "
                         f"{result['findings']:,} parsed findings, and "
                         f"{result['imported']:,} decisions; prefilled "
-                        f"{seeded['reused']:,} blank reviews."
+                        f"{seeded['reused']:,} blank reviews and activated "
+                        f"{len(learning_result['new']):,} new automatic rules."
                     )
                     st.rerun()
                 except DecisionMemoryError as error:
@@ -2217,7 +2359,10 @@ elif page == "Pattern Lab":
           Published human decisions provide the label; the shared Report
           Library shows how often and across how many courses that pattern
           occurs. Unreviewed reports can strengthen coverage evidence but can
-          never decide a status. Promotion remains explicit.
+          never decide a status. Safe, non-conflicting math, standards,
+          spacing, spelling, and terminology patterns are promoted
+          automatically. Ambiguous patterns remain available for manual
+          promotion.
         </div>
         """,
         unsafe_allow_html=True,
@@ -2226,9 +2371,10 @@ elif page == "Pattern Lab":
         st.error(f"Pattern evidence unavailable: {st.session_state.memory_error}")
         suggestions = []
     else:
+        learning_rules, _ = rules_without_automatic_layer()
         suggestions = build_shared_pattern_suggestions(
             shared_pattern_evidence(MEMORY_PATH),
-            st.session_state.rules,
+            learning_rules,
         )
     if not suggestions:
         st.info(
@@ -2236,73 +2382,129 @@ elif page == "Pattern Lab":
             "uploaded, this screen will show the reach of each confirmed pattern."
         )
     else:
-        evidence_col, coverage_col = st.columns(2)
-        max_evidence = max(item["evidence_count"] for item in suggestions)
-        max_coverage = max(item["course_coverage"] for item in suggestions)
-        if max_evidence > 1:
-            min_evidence = evidence_col.slider(
-                "Minimum supporting decisions",
-                min_value=1,
-                max_value=max_evidence,
-                value=1,
-            )
-        else:
-            evidence_col.metric("Human decision range", "1")
-            min_evidence = 1
-        if max_coverage > 1:
-            min_coverage = coverage_col.slider(
-                "Minimum course coverage",
-                min_value=1,
-                max_value=max_coverage,
-                value=min(2, max_coverage),
-            )
-        else:
-            coverage_col.metric("Course coverage range", "1")
-            min_coverage = 1
-        shown = [
+        qualified_automatic = automatic_suggestions(suggestions)
+        automatic_ids = {
+            str(item["suggestion_id"]) for item in qualified_automatic
+        }
+        manual_suggestions = [
             item
             for item in suggestions
-            if item["evidence_count"] >= min_evidence
-            and item["course_coverage"] >= min_coverage
+            if str(item["suggestion_id"]) not in automatic_ids
         ]
-        if not shown:
-            st.info("No pattern meets both evidence filters.")
+        automatic_col, manual_col = st.columns(2)
+        automatic_col.metric(
+            "Learned consensus rules active", f"{len(qualified_automatic):,}"
+        )
+        manual_col.metric(
+            "Patterns awaiting judgment", f"{len(manual_suggestions):,}"
+        )
+        if qualified_automatic:
+            with st.expander("Automatically learned rules", expanded=True):
+                st.dataframe(
+                    pd.DataFrame(qualified_automatic)[
+                        [
+                            "suggestion_type",
+                            "checker",
+                            "original",
+                            "proposed",
+                            "status",
+                            "automation_reason",
+                            "evidence_count",
+                            "course_coverage",
+                            "reports",
+                        ]
+                    ],
+                    width="stretch",
+                    hide_index=True,
+                    column_config={
+                        "evidence_count": st.column_config.NumberColumn(
+                            "Human decisions", format="%d"
+                        ),
+                        "course_coverage": st.column_config.NumberColumn(
+                            "Course coverage", format="%d"
+                        ),
+                    },
+                )
+
+        if not manual_suggestions:
+            st.success(
+                "Every current consensus pattern is already handled "
+                "automatically."
+            )
             chosen = []
         else:
-            suggestion_frame = pd.DataFrame(shown)
-            edited_suggestions = st.data_editor(
-                suggestion_frame,
-                width="stretch",
-                height=540,
-                hide_index=True,
-                disabled=[
-                    column
-                    for column in suggestion_frame.columns
-                    if column != "selected"
-                ],
-                column_config={
-                    "selected": st.column_config.CheckboxColumn(
-                        "Promote", default=False
-                    ),
-                    "suggestion_id": None,
-                    "evidence_count": st.column_config.NumberColumn(
-                        "Human decisions", format="%d"
-                    ),
-                    "human_reports": st.column_config.NumberColumn(
-                        "Reviewed courses", format="%d"
-                    ),
-                    "course_coverage": st.column_config.NumberColumn(
-                        "Course coverage", format="%d"
-                    ),
-                    "occurrences": st.column_config.NumberColumn(
-                        "Occurrences", format="%d"
-                    ),
-                },
-                key="pattern-suggestion-editor",
+            st.markdown("#### Patterns requiring an administrator decision")
+            evidence_col, coverage_col = st.columns(2)
+            max_evidence = max(
+                item["evidence_count"] for item in manual_suggestions
             )
-            chosen = edited_suggestions[
-                edited_suggestions["selected"] == True  # noqa: E712
-            ].to_dict("records")
+            max_coverage = max(
+                item["course_coverage"] for item in manual_suggestions
+            )
+            if max_evidence > 1:
+                min_evidence = evidence_col.slider(
+                    "Minimum supporting decisions",
+                    min_value=1,
+                    max_value=max_evidence,
+                    value=1,
+                )
+            else:
+                evidence_col.metric("Human decision range", "1")
+                min_evidence = 1
+            if max_coverage > 1:
+                min_coverage = coverage_col.slider(
+                    "Minimum course coverage",
+                    min_value=1,
+                    max_value=max_coverage,
+                    value=min(2, max_coverage),
+                )
+            else:
+                coverage_col.metric("Course coverage range", "1")
+                min_coverage = 1
+            shown = [
+                item
+                for item in manual_suggestions
+                if item["evidence_count"] >= min_evidence
+                and item["course_coverage"] >= min_coverage
+            ]
+            if not shown:
+                st.info("No pattern meets both evidence filters.")
+                chosen = []
+            else:
+                suggestion_frame = pd.DataFrame(shown)
+                edited_suggestions = st.data_editor(
+                    suggestion_frame,
+                    width="stretch",
+                    height=540,
+                    hide_index=True,
+                    disabled=[
+                        column
+                        for column in suggestion_frame.columns
+                        if column != "selected"
+                    ],
+                    column_config={
+                        "selected": st.column_config.CheckboxColumn(
+                            "Promote", default=False
+                        ),
+                        "suggestion_id": None,
+                        "evidence_count": st.column_config.NumberColumn(
+                            "Human decisions", format="%d"
+                        ),
+                        "human_reports": st.column_config.NumberColumn(
+                            "Reviewed courses", format="%d"
+                        ),
+                        "course_coverage": st.column_config.NumberColumn(
+                            "Course coverage", format="%d"
+                        ),
+                        "occurrences": st.column_config.NumberColumn(
+                            "Occurrences", format="%d"
+                        ),
+                    },
+                    key="pattern-suggestion-editor",
+                )
+                chosen = edited_suggestions[
+                    edited_suggestions["selected"] == True  # noqa: E712
+                ].to_dict("records")
         if st.button(
             f"Promote {len(chosen):,} selected patterns",
             type="primary",
@@ -2327,24 +2529,28 @@ elif page == "Pattern Lab":
 
 
 else:
-    rule_cols = st.columns(3)
+    rule_cols = st.columns(4)
     rule_cols[0].metric(
         "Protected spelling terms",
         len(st.session_state.rules["protected_spelling_terms"]),
     )
     rule_cols[1].metric(
-        "Exact human-approved rules", len(st.session_state.rules["exact_rules"])
+        "Exact learned rules", len(st.session_state.rules["exact_rules"])
     )
     rule_cols[2].metric(
         "Safe typo targets", len(st.session_state.rules["safe_typo_targets"])
     )
+    rule_cols[3].metric(
+        "Learned consensus rules",
+        len(st.session_state.get("automatic_rule_ids", [])),
+    )
     st.markdown(
         """
         <p class="qa-rule-note">
-          Base rules are version-controlled. Pattern Lab promotions affect this
-          browser session until you download the JSON. Commit that file as the
-          app's <code>rules/base_rules.json</code>, or run the included sync
-          script to make it available to the Codex skill.
+          Base rules are version-controlled. Safe shared patterns are rebuilt
+          automatically from Decision Memory whenever the app starts or new
+          evidence arrives. Manual Pattern Lab promotions affect this browser
+          session until you download the JSON.
         </p>
         """,
         unsafe_allow_html=True,

@@ -20,7 +20,8 @@ browser, and download fully quoted Kiddom import CSVs.
 - An editable human-review queue with source context and Kiddom node links
 - Import/export compatibility with `flagged_for_review.csv`
 - Final, detailed, review-sheet, and ZIP package downloads
-- A Pattern Lab that proposes new rules from saved human decisions
+- A Pattern Lab that shows automatically learned rules and patterns still
+  requiring administrator judgment
 - A shared Report Library that automatically retains compact parsed snapshots
   of every uploaded course
 - Shared draft reviews, so another user can reopen a report and continue
@@ -29,7 +30,8 @@ browser, and download fully quoted Kiddom import CSVs.
 - Exact and high-confidence near matching with source provenance
 - Conflict detection that leaves disputed findings for human review
 - Cross-report overlap and course-coverage evidence for safer generalization
-- Explicit rule promotion—no silent or automatic learning
+- Conservative automatic learning for non-conflicting math, standards,
+  spacing, spelling, and recurring valid-term patterns
 - A JSON rulebook that can be version-controlled and synced to the Codex skill
 
 ## Run locally
@@ -103,16 +105,25 @@ Use the Decision Memory screen to download a portable JSON backup or merge a
 backup from another deployment. The backup includes saved report snapshots,
 shared drafts, and published decision observations.
 
-To build and persist learning:
+To build and reuse learning:
 
 1. Upload reports; each parsed snapshot enters the shared Report Library.
 2. Save human decisions as shared drafts.
 3. Publish a completed review to **Decision Memory** for cross-report reuse.
-4. Open **Pattern Lab** to compare human support, occurrences, and course
-   coverage.
-5. Promote only safe suggestions.
-6. Download `kiddom_qa_rules.json`.
-7. Replace `rules/base_rules.json` in the repository and redeploy.
+4. The app automatically activates safe consensus rules. Math-checker false
+   positives can activate after one confirmed decision; new spacing,
+   capitalization, and spelling signatures require consistent decisions
+   across at least two reviewed courses. Recurring valid terms require one
+   confirmed decision plus occurrence in another course.
+5. Open **Pattern Lab** to inspect active automatic rules and manually decide
+   only the patterns that remain ambiguous.
+6. Download `kiddom_qa_rules.json` when you want to version the learned rules
+   or sync them to the Codex skill.
+
+Patterns with conflicting decisions or a `needs_change` result are never
+promoted automatically. Existing structural rules for math markup, standards
+codes, and unambiguous spacing apply on first sight and never enter the human
+queue.
 
 Stored but unreviewed reports can increase occurrence and course-coverage
 evidence. They never supply a decision label. Only published human decisions
@@ -264,8 +275,9 @@ python scripts/sync_rules_to_skill.py /path/to/kiddom_qa_rules.json
 Use `--skill-dir /custom/path/kiddom-qa-report-review` if the skill is not in
 the default `~/.codex/skills` location.
 
-The sync is explicit by design. Reviewers can propose patterns, but an
-administrator decides which patterns become production rules.
+The app applies safe automatic rules within the shared deployment. Syncing a
+downloaded rulebook into the separate Codex skill remains explicit so its
+version-controlled rules do not change silently.
 
 ## Rule behavior
 
@@ -274,10 +286,13 @@ administrator decides which patterns become production rules.
 - `protected_spelling_terms`: valid jargon and notation that should be rejected
   as spelling-checker false positives
 - `safe_typo_targets`: narrow common-word corrections that are safe to approve
-- `exact_rules`: admin-promoted checker/field/original/proposed decisions
+- `exact_rules`: automatically learned or administrator-promoted
+  checker/field/original/proposed decisions
 
-Exact rules run before the general classifier. Keep them narrow and promote
-only patterns supported by clear evidence.
+Exact rules run before the general classifier. Automatic exact rules are
+limited to non-conflicting consensus evidence; context-sensitive standards
+and spacing rules stay in the structural classifier unless multiple reviewed
+courses agree.
 
 ## Test
 
