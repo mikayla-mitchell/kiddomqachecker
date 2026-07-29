@@ -13,12 +13,19 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
+from auth_access import (
+    AccessDeniedError,
+    UserIdentity,
+    build_user_identity,
+    local_development_identity,
+)
 from decision_memory import (
     DecisionMemoryError,
     export_memory_bytes,
     import_memory_bytes,
     initialize_memory,
     library_stats,
+    list_report_review_activity,
     list_report_library,
     load_draft_reviews,
     load_report_jira_link,
@@ -26,6 +33,7 @@ from decision_memory import (
     match_report_rows,
     memory_stats,
     publish_report_reviews,
+    record_review_events,
     report_similarity,
     save_draft_reviews,
     save_report_jira_link,
@@ -149,7 +157,83 @@ def report_content_id(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
-def initialize_state() -> None:
+def _secret_section(name: str) -> Mapping[str, object]:
+    try:
+        section = st.secrets.get(name, {})
+    except (FileNotFoundError, KeyError):
+        return {}
+    return section if isinstance(section, Mapping) else {}
+
+
+def access_configuration() -> dict[str, object]:
+    section = _secret_section("access")
+    domains = section.get("allowed_email_domains", [])
+    admins = section.get("admin_emails", [])
+    return {
+        "allowed_email_domains": domains,
+        "admin_emails": admins,
+        "jira_reviewer_mode": str(
+            section.get("jira_reviewer_mode") or "self"
+        ).strip().casefold(),
+    }
+
+
+def google_auth_is_configured() -> bool:
+    return bool(_secret_section("auth"))
+
+
+def enforce_google_workspace_login() -> UserIdentity:
+    if not google_auth_is_configured():
+        return local_development_identity()
+
+    if not st.user.is_logged_in:
+        st.markdown(
+            '<div class="qa-kicker">Kiddom Google Workspace</div>',
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            '<div class="qa-title">Sign in to QA Review Studio</div>',
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            """
+            <div class="qa-subtitle">
+              Use your work Google account. Your identity is used to load your
+              Jira assignments and record reviewer activity outside the final
+              training CSV.
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        if st.button("Continue with Google", type="primary"):
+            st.login()
+        st.stop()
+
+    claims = st.user.to_dict()
+    access = access_configuration()
+    try:
+        return build_user_identity(
+            claims,
+            allowed_email_domains=access["allowed_email_domains"],
+            admin_emails=access["admin_emails"],
+        )
+    except AccessDeniedError as error:
+        st.error(str(error))
+        if st.button("Sign out"):
+            st.logout()
+        st.stop()
+
+
+def jira_account_mapping() -> dict[str, str]:
+    section = _secret_section("jira_user_map")
+    return {
+        str(email).strip().casefold(): str(account_id).strip()
+        for email, account_id in section.items()
+        if str(email).strip() and str(account_id).strip()
+    }
+
+
+def initialize_state(user: UserIdentity) -> None:
     if "rules" not in st.session_state:
         st.session_state.rules = load_rules(BASE_RULES_PATH)
     if "reports" not in st.session_state:
@@ -164,6 +248,13 @@ def initialize_state() -> None:
         st.session_state.jira_issues = []
     if "jira_qa_people" not in st.session_state:
         st.session_state.jira_qa_people = []
+    if "jira_admin_people" not in st.session_state:
+        st.session_state.jira_admin_people = []
+    if st.session_state.get("active_reviewer_email") != user.email:
+        st.session_state.jira_people = []
+        st.session_state.jira_issues = []
+        st.session_state.pop("jira_selected_issue", None)
+        st.session_state.active_reviewer_email = user.email
     if "memory_initialized" not in st.session_state:
         try:
             initialize_memory(MEMORY_PATH)
@@ -171,6 +262,30 @@ def initialize_state() -> None:
         except (DecisionMemoryError, OSError) as error:
             st.session_state.memory_error = str(error)
         st.session_state.memory_initialized = True
+
+
+def record_report_activity(
+    report: dict,
+    action: str,
+    events: list[dict],
+    user: UserIdentity,
+) -> None:
+    if (
+        not events
+        or st.session_state.memory_error
+        or not report.get("library_saved")
+    ):
+        return
+    try:
+        record_review_events(
+            MEMORY_PATH,
+            report["report_id"],
+            action,
+            user.as_dict(),
+            events,
+        )
+    except (DecisionMemoryError, OSError) as error:
+        st.warning(f"The review was saved, but its reviewer audit was not: {error}")
 
 
 def normalize_ui_decision(raw: str, note: str = "") -> tuple[str, str]:
@@ -476,13 +591,17 @@ def render_jira_setup(configuration_error: str) -> None:
     )
 
 
-def render_jira_workspace(config: JiraConfig | None, configuration_error: str) -> None:
+def render_jira_workspace(
+    config: JiraConfig | None,
+    configuration_error: str,
+    user: UserIdentity,
+) -> None:
     st.markdown("### Jira ticket workspace")
     st.markdown(
         """
-        Find a reviewer, open their assigned curriculum tickets, and load an
-        attached Issue Annotation Report directly into this app. Links in the
-        ticket remain available to open in a new tab.
+        Open your assigned curriculum tickets and load an attached Issue
+        Annotation Report directly into this app. Links in the ticket remain
+        available to open in a new tab.
         """
     )
     if config is None:
@@ -503,56 +622,107 @@ def render_jira_workspace(config: JiraConfig | None, configuration_error: str) -
         else "Ticket scope: all visible Jira projects"
     )
 
-    with st.form("jira-reviewer-search"):
-        reviewer_query = st.text_input(
-            "Find your name",
-            placeholder="Start typing a Jira display name or email",
-        )
-        reviewer_search_clicked = st.form_submit_button(
-            "Search Jira people",
-            type="primary",
-            disabled=not reviewer_query.strip(),
-        )
-    if reviewer_search_clicked:
-        try:
-            st.session_state.jira_people = client.search_users(reviewer_query)
-        except JiraIntegrationError as error:
-            st.error(str(error))
+    access = access_configuration()
+    self_service = (
+        user.is_authenticated and access["jira_reviewer_mode"] == "self"
+    )
 
-    people = st.session_state.jira_people
-    reviewer = None
-    if people:
-        people_by_id = {person["account_id"]: person for person in people}
-        reviewer_id = st.selectbox(
-            "Reviewer",
-            options=list(people_by_id),
-            format_func=lambda account_id: (
-                people_by_id[account_id]["display_name"]
-                + (
-                    f" · {people_by_id[account_id]['email']}"
-                    if people_by_id[account_id]["email"]
-                    else ""
-                )
-            ),
-            key="jira-reviewer",
+    if self_service:
+        st.markdown(f"**Reviewer:** {user.name} · {user.email}")
+        first_lookup = (
+            st.session_state.get("jira_self_lookup_email") != user.email
         )
-        reviewer = people_by_id[reviewer_id]
-        if st.button(
-            "Find assigned tickets",
+        retry_lookup = st.button(
+            "Refresh my assigned tickets",
             type="primary",
-            key="jira-find-assigned",
-        ):
+            key="jira-refresh-self",
+        )
+        if first_lookup or retry_lookup:
+            st.session_state.jira_self_lookup_email = user.email
+            st.session_state.jira_self_lookup_error = ""
             try:
-                st.session_state.jira_issues = client.search_assigned_issues(
-                    reviewer["account_id"]
-                )
+                account_id = jira_account_mapping().get(user.email)
+                if account_id:
+                    reviewer = {
+                        "account_id": account_id,
+                        "display_name": user.name,
+                        "email": user.email,
+                        "active": True,
+                    }
+                else:
+                    reviewer = client.find_user_for_identity(
+                        user.email, user.name
+                    )
+                with st.spinner(f"Loading Jira tickets for {reviewer['display_name']}…"):
+                    st.session_state.jira_people = [reviewer]
+                    st.session_state.jira_issues = client.search_assigned_issues(
+                        reviewer["account_id"]
+                    )
             except JiraIntegrationError as error:
-                st.error(str(error))
+                st.session_state.jira_issues = []
+                st.session_state.jira_self_lookup_error = str(error)
+        if st.session_state.get("jira_self_lookup_error"):
+            st.error(st.session_state.jira_self_lookup_error)
+
+    manual_search_allowed = not self_service or user.is_admin
+    if manual_search_allowed:
+        container = (
+            st.expander("Administrator: open another reviewer's tickets")
+            if self_service
+            else st.container()
+        )
+        with container:
+            with st.form("jira-reviewer-search"):
+                reviewer_query = st.text_input(
+                    "Find a reviewer",
+                    placeholder="Start typing a Jira display name or email",
+                )
+                reviewer_search_clicked = st.form_submit_button(
+                    "Search Jira people",
+                    disabled=not reviewer_query.strip(),
+                )
+            if reviewer_search_clicked:
+                try:
+                    st.session_state.jira_admin_people = client.search_users(
+                        reviewer_query
+                    )
+                except JiraIntegrationError as error:
+                    st.error(str(error))
+
+            people = st.session_state.get("jira_admin_people", [])
+            if people:
+                people_by_id = {
+                    person["account_id"]: person for person in people
+                }
+                reviewer_id = st.selectbox(
+                    "Reviewer",
+                    options=list(people_by_id),
+                    format_func=lambda account_id: (
+                        people_by_id[account_id]["display_name"]
+                        + (
+                            f" · {people_by_id[account_id]['email']}"
+                            if people_by_id[account_id]["email"]
+                            else ""
+                        )
+                    ),
+                    key="jira-reviewer",
+                )
+                if st.button(
+                    "Find assigned tickets",
+                    type="primary",
+                    key="jira-find-assigned",
+                ):
+                    try:
+                        st.session_state.jira_issues = (
+                            client.search_assigned_issues(reviewer_id)
+                        )
+                    except JiraIntegrationError as error:
+                        st.error(str(error))
 
     issues = st.session_state.jira_issues
     if not issues:
-        if people:
-            st.caption("Choose a reviewer, then find their assigned tickets.")
+        if not st.session_state.get("jira_self_lookup_error"):
+            st.info("No matching open Jira tickets are currently assigned.")
         return
 
     issues_by_key = {issue["key"]: issue for issue in issues}
@@ -671,6 +841,7 @@ def render_jira_handoff(
     outstanding: int,
     config: JiraConfig | None,
     configuration_error: str,
+    user: UserIdentity,
 ) -> None:
     st.divider()
     st.markdown("#### Send completed review to Jira")
@@ -787,6 +958,20 @@ def render_jira_handoff(
                     config.ready_for_qa_status,
                 )
             report["jira_handoff"] = steps
+            record_report_activity(
+                report,
+                "jira_handoff",
+                [
+                    {
+                        "detail": {
+                            "issue_key": issue["key"],
+                            "csv_filename": csv_filename,
+                            "steps": steps,
+                        }
+                    }
+                ],
+                user,
+            )
             st.success(f"Jira ticket {issue['key']} is ready for QA.")
             st.dataframe(pd.DataFrame(steps), hide_index=True, width="stretch")
         except JiraHandoffError as error:
@@ -803,7 +988,8 @@ def render_jira_handoff(
             st.error(str(error))
 
 
-initialize_state()
+current_user = enforce_google_workspace_login()
+initialize_state(current_user)
 jira_config, jira_config_error = jira_configuration()
 
 st.markdown('<div class="qa-kicker">Curriculum quality operations</div>', unsafe_allow_html=True)
@@ -822,6 +1008,17 @@ st.markdown(
 
 
 with st.sidebar:
+    if current_user.is_authenticated:
+        st.markdown(f"**{current_user.name}**")
+        st.caption(current_user.email)
+        if current_user.is_admin:
+            st.caption("App administrator")
+        if st.button("Sign out", width="stretch"):
+            st.logout()
+        st.divider()
+    else:
+        st.caption("Local development mode · Google sign-in is not configured")
+
     st.header("1 · Add reports")
     uploads = st.file_uploader(
         "Kiddom report HTML",
@@ -983,7 +1180,7 @@ primary_workspace = st.radio(
     key="primary_workspace",
 )
 if primary_workspace == "Jira tickets":
-    render_jira_workspace(jira_config, jira_config_error)
+    render_jira_workspace(jira_config, jira_config_error, current_user)
     st.stop()
 
 
@@ -1125,6 +1322,32 @@ if page == "Review report":
                         )
                     },
                 )
+            review_activity = list_report_review_activity(
+                MEMORY_PATH, report["report_id"], limit=25
+            )
+            if review_activity:
+                with st.expander("Reviewer activity"):
+                    st.caption(
+                        "Identity and workflow history stay in the shared audit "
+                        "log and are never added to the final training CSV."
+                    )
+                    st.dataframe(
+                        pd.DataFrame(
+                            [
+                                {
+                                    "Reviewer": item["reviewer_name"],
+                                    "Email": item["reviewer_email"],
+                                    "Action": item["action"].replace("_", " ").title(),
+                                    "Issue": item["issue_id"],
+                                    "Decision": item["decision"],
+                                    "Time": item["occurred_at"],
+                                }
+                                for item in review_activity
+                            ]
+                        ),
+                        width="stretch",
+                        hide_index=True,
+                    )
         summary = (
             pd.DataFrame(report["rows"])
             .groupby(["checker", "status"])
@@ -1230,6 +1453,7 @@ if page == "Review report":
             )
             if st.button("Save visible decisions", type="primary"):
                 draft_updates = {}
+                changed_events = []
                 for row in edited.to_dict("records"):
                     issue_id = str(row["issue_id"])
                     decision, note = normalize_ui_decision(
@@ -1247,6 +1471,13 @@ if page == "Review report":
                             "decision": decision,
                             "review_note": note,
                         }
+                        changed_events.append(
+                            {
+                                "issue_id": issue_id,
+                                "decision": decision,
+                                "detail": {"review_note": note},
+                            }
+                        )
                     draft_updates[issue_id] = report["reviews"][issue_id]
                 if (
                     not st.session_state.memory_error
@@ -1263,6 +1494,12 @@ if page == "Review report":
                     )
                 else:
                     st.success(f"Saved {len(edited):,} visible rows in this session.")
+                record_report_activity(
+                    report,
+                    "save_decisions",
+                    changed_events,
+                    current_user,
+                )
                 st.rerun()
 
             with st.expander("Import a reviewed CSV instead"):
@@ -1277,6 +1514,10 @@ if page == "Review report":
                     key=f"review-import-button-{selected_key}",
                 ):
                     try:
+                        before_import = {
+                            issue_id: dict(review)
+                            for issue_id, review in report["reviews"].items()
+                        }
                         applied, unmatched = import_review_sheet(
                             imported_review.getvalue(), report
                         )
@@ -1289,6 +1530,25 @@ if page == "Review report":
                                 report["report_id"],
                                 report["reviews"],
                             )
+                        imported_events = [
+                            {
+                                "issue_id": issue_id,
+                                "decision": str(review.get("decision") or ""),
+                                "detail": {
+                                    "review_note": str(
+                                        review.get("review_note") or ""
+                                    )
+                                },
+                            }
+                            for issue_id, review in report["reviews"].items()
+                            if review != before_import.get(issue_id, {})
+                        ]
+                        record_report_activity(
+                            report,
+                            "import_review_sheet",
+                            imported_events,
+                            current_user,
+                        )
                         if unmatched:
                             st.warning(
                                 f"Imported {applied:,} decisions; ignored "
@@ -1376,6 +1636,22 @@ if page == "Review report":
                 report["reviews"],
             )
             report["memory_published"] = result["published"]
+            record_report_activity(
+                report,
+                "publish_to_memory",
+                [
+                    {
+                        "detail": {
+                            "published": result["published"],
+                            "skipped_blank": result["skipped_blank"],
+                            "skipped_unmatchable": result[
+                                "skipped_unmatchable"
+                            ],
+                        }
+                    }
+                ],
+                current_user,
+            )
             newly_seeded = seed_all_loaded_reports()
             st.session_state.memory_publish_flash = {
                 **result,
@@ -1445,6 +1721,7 @@ if page == "Review report":
             outstanding,
             jira_config,
             jira_config_error,
+            current_user,
         )
 
     with detail_tab:

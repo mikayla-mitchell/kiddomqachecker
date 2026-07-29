@@ -6,6 +6,7 @@ import io
 import json
 import re
 import sqlite3
+import uuid
 from collections import defaultdict
 from contextlib import closing
 from datetime import datetime, timezone
@@ -17,7 +18,7 @@ from comment_policy import training_comment
 from qa_engine import parse_decision
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 FINGERPRINT_VERSION = 1
 DEFAULT_NEAR_MATCH_THRESHOLD = 0.97
 VALID_STATUSES = {"approved", "rejected", "needs_change"}
@@ -80,6 +81,17 @@ JIRA_LINK_FIELDS = (
     "issue_url",
     "attachment_id",
     "updated_at",
+)
+REVIEW_EVENT_FIELDS = (
+    "event_id",
+    "report_id",
+    "issue_id",
+    "action",
+    "decision",
+    "reviewer_email",
+    "reviewer_name",
+    "detail_json",
+    "occurred_at",
 )
 
 URL_RE = re.compile(r"https?://\S+", re.I)
@@ -280,13 +292,32 @@ def _connect(path: str | Path) -> sqlite3.Connection:
             FOREIGN KEY(report_id) REFERENCES stored_reports(report_id)
                 ON DELETE CASCADE
         );
+
+        CREATE TABLE IF NOT EXISTS review_events (
+            event_id TEXT PRIMARY KEY,
+            report_id TEXT NOT NULL,
+            issue_id TEXT NOT NULL,
+            action TEXT NOT NULL,
+            decision TEXT NOT NULL,
+            reviewer_email TEXT NOT NULL,
+            reviewer_name TEXT NOT NULL,
+            detail_json TEXT NOT NULL,
+            occurred_at TEXT NOT NULL,
+            FOREIGN KEY(report_id) REFERENCES stored_reports(report_id)
+                ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_review_events_report
+            ON review_events(report_id, occurred_at);
+        CREATE INDEX IF NOT EXISTS idx_review_events_reviewer
+            ON review_events(reviewer_email, occurred_at);
         """
     )
     stored_schema = connection.execute(
         "SELECT value FROM metadata WHERE key='schema_version'"
     ).fetchone()
     stored_version = int(stored_schema["value"]) if stored_schema else SCHEMA_VERSION
-    if stored_version not in {1, SCHEMA_VERSION}:
+    if stored_version not in {1, 2, SCHEMA_VERSION}:
         connection.close()
         raise DecisionMemoryError("Unsupported decision-memory database schema.")
     connection.execute(
@@ -551,6 +582,84 @@ def load_report_jira_link(
         "attachment_id": str(row["attachment_id"]),
         "updated_at": str(row["updated_at"]),
     }
+
+
+def record_review_events(
+    path: str | Path,
+    report_id: str,
+    action: str,
+    reviewer: Mapping[str, Any],
+    events: Iterable[Mapping[str, Any]],
+) -> int:
+    reviewer_email = str(reviewer.get("email") or "").strip().casefold()
+    reviewer_name = str(reviewer.get("name") or reviewer_email or "Unknown reviewer")
+    normalized_action = str(action or "").strip()
+    if not normalized_action:
+        raise DecisionMemoryError("A review event requires an action.")
+    if not reviewer_email:
+        raise DecisionMemoryError("A review event requires a reviewer email.")
+
+    values = []
+    now = _utc_now()
+    for event in events:
+        detail = event.get("detail")
+        detail = detail if isinstance(detail, Mapping) else {}
+        values.append(
+            (
+                uuid.uuid4().hex,
+                report_id,
+                str(event.get("issue_id") or ""),
+                normalized_action,
+                str(event.get("decision") or ""),
+                reviewer_email,
+                reviewer_name,
+                json.dumps(detail, ensure_ascii=False, separators=(",", ":"), default=str),
+                now,
+            )
+        )
+    if not values:
+        return 0
+    with closing(_connect(path)) as connection, connection:
+        try:
+            connection.executemany(
+                """
+                INSERT INTO review_events(
+                    event_id, report_id, issue_id, action, decision,
+                    reviewer_email, reviewer_name, detail_json, occurred_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                values,
+            )
+        except sqlite3.IntegrityError as error:
+            raise DecisionMemoryError(
+                "Save the report snapshot before recording reviewer activity."
+            ) from error
+    return len(values)
+
+
+def list_report_review_activity(
+    path: str | Path, report_id: str, limit: int = 50
+) -> list[dict[str, Any]]:
+    with closing(_connect(path)) as connection:
+        rows = connection.execute(
+            """
+            SELECT *
+            FROM review_events
+            WHERE report_id = ?
+            ORDER BY occurred_at DESC, event_id DESC
+            LIMIT ?
+            """,
+            (report_id, max(1, int(limit))),
+        ).fetchall()
+    activity = []
+    for row in rows:
+        item = dict(row)
+        try:
+            item["detail"] = json.loads(str(item.pop("detail_json")))
+        except json.JSONDecodeError:
+            item["detail"] = {}
+        activity.append(item)
+    return activity
 
 
 def list_report_library(path: str | Path) -> list[dict[str, Any]]:
@@ -1051,6 +1160,12 @@ def export_memory_bytes(path: str | Path) -> bytes:
                 "SELECT * FROM report_jira_links ORDER BY report_id"
             ).fetchall()
         ]
+        review_events = [
+            dict(row)
+            for row in connection.execute(
+                "SELECT * FROM review_events ORDER BY occurred_at, event_id"
+            ).fetchall()
+        ]
     payload = {
         "schema_version": SCHEMA_VERSION,
         "fingerprint_version": FINGERPRINT_VERSION,
@@ -1060,6 +1175,7 @@ def export_memory_bytes(path: str | Path) -> bytes:
         "report_findings": report_findings,
         "draft_reviews": draft_reviews,
         "jira_links": jira_links,
+        "review_events": review_events,
     }
     return (json.dumps(payload, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
 
@@ -1070,7 +1186,7 @@ def import_memory_bytes(path: str | Path, payload: bytes) -> dict[str, int]:
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise DecisionMemoryError("The decision-memory file is not valid JSON.") from error
     imported_schema = data.get("schema_version")
-    if imported_schema not in {1, SCHEMA_VERSION}:
+    if imported_schema not in {1, 2, SCHEMA_VERSION}:
         raise DecisionMemoryError("Unsupported decision-memory schema.")
     if data.get("fingerprint_version") != FINGERPRINT_VERSION:
         raise DecisionMemoryError("Unsupported decision fingerprint version.")
@@ -1081,9 +1197,16 @@ def import_memory_bytes(path: str | Path, payload: bytes) -> dict[str, int]:
     report_findings = data.get("report_findings", [])
     draft_reviews = data.get("draft_reviews", [])
     jira_links = data.get("jira_links", [])
+    review_events = data.get("review_events", [])
     if not all(
         isinstance(collection, list)
-        for collection in (reports, report_findings, draft_reviews, jira_links)
+        for collection in (
+            reports,
+            report_findings,
+            draft_reviews,
+            jira_links,
+            review_events,
+        )
     ):
         raise DecisionMemoryError("Report-library collections must be lists.")
 
@@ -1092,6 +1215,7 @@ def import_memory_bytes(path: str | Path, payload: bytes) -> dict[str, int]:
     imported_reports = 0
     imported_findings = 0
     imported_drafts = 0
+    imported_events = 0
     with closing(_connect(path)) as connection, connection:
         for report in reports:
             if not isinstance(report, dict) or not set(REPORT_FIELDS).issubset(report):
@@ -1217,6 +1341,26 @@ def import_memory_bytes(path: str | Path, payload: bytes) -> dict[str, int]:
                 tuple(jira_link[field] for field in JIRA_LINK_FIELDS),
             )
 
+        for event in review_events:
+            if (
+                not isinstance(event, dict)
+                or not set(REVIEW_EVENT_FIELDS).issubset(event)
+            ):
+                raise DecisionMemoryError(
+                    "A reviewer activity entry is missing required fields."
+                )
+            connection.execute(
+                """
+                INSERT INTO review_events(
+                    event_id, report_id, issue_id, action, decision,
+                    reviewer_email, reviewer_name, detail_json, occurred_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(event_id) DO NOTHING
+                """,
+                tuple(event[field] for field in REVIEW_EVENT_FIELDS),
+            )
+            imported_events += 1
+
         for observation in observations:
             if not isinstance(observation, dict) or not required.issubset(observation):
                 raise DecisionMemoryError(
@@ -1255,4 +1399,5 @@ def import_memory_bytes(path: str | Path, payload: bytes) -> dict[str, int]:
         "reports": imported_reports,
         "findings": imported_findings,
         "drafts": imported_drafts,
+        "events": imported_events,
     }

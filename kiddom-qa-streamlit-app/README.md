@@ -8,6 +8,8 @@ browser, and download fully quoted Kiddom import CSVs.
 ## What the app includes
 
 - Multi-file HTML upload and issue deduplication
+- Google Workspace sign-in with an approved-domain allowlist
+- Signed-in reviewer attribution kept in a separate shared audit history
 - An optional Jira Cloud workspace for finding reviewers and their assigned
   tickets
 - Direct, authenticated loading of HTML attachments from Jira tickets
@@ -51,8 +53,8 @@ parsed findings. For these reports, use a deployment with at least 4 GB RAM;
 
 1. Put this folder in a GitHub repository.
 2. In Streamlit Community Cloud, create an app using `app.py` as the entrypoint.
-3. Deploy. Jira secrets are optional; without them, the normal HTML upload
-   workflow remains available.
+3. Deploy. Google and Jira secrets are optional for local development. Add the
+   Google secrets before sharing the production URL.
 
 Streamlit Community Cloud is convenient for smaller reports. Its available
 memory can vary, so use a larger container/VM deployment for the largest
@@ -116,12 +118,66 @@ Stored but unreviewed reports can increase occurrence and course-coverage
 evidence. They never supply a decision label. Only published human decisions
 can prefill later reviews or become candidates for rule promotion.
 
+## Google Workspace sign-in
+
+Production access uses Streamlit's OpenID Connect support with Google
+Workspace. When `[auth]` is present in deployment secrets, the app becomes a
+sign-in gate: reviewers must authenticate before any report, Jira ticket, or
+shared memory screen is available. The app verifies the email and applies the
+domain allowlist in `[access]`.
+
+Set it up once:
+
+1. In a Google Cloud project owned by the Kiddom Workspace organization, open
+   **Google Auth Platform**.
+2. Configure the app audience as **Internal**. If you cannot select Internal or
+   create credentials, ask a Google Workspace/Cloud administrator to do these
+   steps.
+3. Create an OAuth client with application type **Web application**.
+4. Add exactly one production redirect URI:
+   `https://YOUR-APP.streamlit.app/oauth2callback`.
+5. Copy the client ID and client secret into the Streamlit app's
+   **Settings → Secrets**, along with a long random cookie secret:
+
+```toml
+[auth]
+redirect_uri = "https://YOUR-APP.streamlit.app/oauth2callback"
+cookie_secret = "replace-with-a-long-random-secret"
+client_id = "YOUR-GOOGLE-CLIENT-ID.apps.googleusercontent.com"
+client_secret = "YOUR-GOOGLE-CLIENT-SECRET"
+server_metadata_url = "https://accounts.google.com/.well-known/openid-configuration"
+
+[access]
+allowed_email_domains = ["kiddom.co"]
+admin_emails = ["app-owner@kiddom.co"]
+jira_reviewer_mode = "self"
+```
+
+The redirect URI must match in Google Cloud and Streamlit Secrets character for
+character. Save the secrets, reboot the app, and open it in a private browser
+window to verify the Google sign-in screen and domain restriction.
+
+With `jira_reviewer_mode = "self"`, the app resolves the signed-in Google email
+to the corresponding Jira Cloud user and loads that person's assigned tickets.
+Listed app administrators also get a control for opening another reviewer's
+tickets. If Jira hides email addresses or returns an ambiguous result, map only
+those users explicitly:
+
+```toml
+[jira_user_map]
+"reviewer@kiddom.co" = "712020:their-jira-cloud-account-id"
+```
+
+Local development remains available without `[auth]` and is labeled as local
+development mode. Do not share a production deployment until its Google auth
+secrets are configured.
+
 ## Jira Cloud workflow
 
 Jira is optional. When configured, reviewers can:
 
 1. Open **Jira tickets** in the app.
-2. Search for their Jira display name or email.
+2. Have their signed-in Google Workspace identity matched to Jira.
 3. See open tickets assigned to them, optionally limited to one project.
 4. Open links from the ticket or load an attached `.html` / `.htm` report
    directly into the existing QA review pipeline.
@@ -141,10 +197,10 @@ enter the same secret values in the deployment settings:
 
 ```toml
 [jira]
-base_url = "https://your-company.atlassian.net"
+base_url = "https://kiddom.atlassian.net"
 user_email = "jira-service-account@example.com"
 api_token = "..."
-project_key = "CURR"
+project_key = "PMIM"
 ready_for_qa_status = "Ready for QA"
 qa_account_id = "..."
 max_results = 50
@@ -169,6 +225,12 @@ The Jira workflow still depends on the service account having permission to
 browse users and issues, add attachments, transition the chosen workflow, and
 assign the issue.
 
+Google sign-in identifies and authorizes the reviewer inside this app. Jira
+mutations still use the shared service account, so Jira's own change history
+will name that integration account. The app separately records the signed-in
+reviewer, action, report, and timestamp in shared audit history. That identity
+data is never written to the final training CSV.
+
 Keep `.streamlit/secrets.toml` out of source control. It is included in
 `.gitignore`. The service account token stays server-side and is never shown in
 the app.
@@ -185,9 +247,10 @@ as:
 - an exact correction such as "Use an ellipsis."
 
 The final export removes AI/checker confidence, missing-reasoning, ambiguity,
-workflow, and human-review language. Those internal explanations remain
-available in the detailed CSV and review interface. The same filter is applied
-before published review notes enter shared Decision Memory.
+workflow, human-review, and reviewer-identity language. Those internal
+explanations remain available in the detailed CSV and review interface.
+Reviewer identity is stored only in the app's audit history. The same comment
+filter is applied before published review notes enter shared Decision Memory.
 
 ## Sync approved patterns to the Codex skill
 

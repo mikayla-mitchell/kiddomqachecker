@@ -283,6 +283,47 @@ class JiraClient:
             if isinstance(item, Mapping) and item.get("accountId")
         ]
 
+    def find_user_for_identity(self, email: str, name: str = "") -> dict[str, str]:
+        normalized_email = email.strip().casefold()
+        normalized_name = name.strip().casefold()
+        candidates: dict[str, dict[str, str]] = {}
+        for query in dict.fromkeys(
+            value for value in (email.strip(), name.strip()) if value
+        ):
+            for person in self.search_users(query):
+                if person["active"]:
+                    candidates[person["account_id"]] = person
+            exact_email = next(
+                (
+                    person
+                    for person in candidates.values()
+                    if person["email"].strip().casefold() == normalized_email
+                ),
+                None,
+            )
+            if exact_email:
+                return exact_email
+
+        if len(candidates) == 1:
+            return next(iter(candidates.values()))
+        exact_name_matches = [
+            person
+            for person in candidates.values()
+            if normalized_name
+            and person["display_name"].strip().casefold() == normalized_name
+        ]
+        if len(exact_name_matches) == 1:
+            return exact_name_matches[0]
+        if not candidates:
+            raise JiraIntegrationError(
+                "No active Jira user matches your Google Workspace account. "
+                "Ask the app administrator to add your email to [jira_user_map]."
+            )
+        raise JiraIntegrationError(
+            "More than one Jira user could match your Google Workspace account. "
+            "Ask the app administrator to add your email to [jira_user_map]."
+        )
+
     def _assigned_jql(self, account_id: str) -> str:
         if self.config.ticket_jql:
             return (
