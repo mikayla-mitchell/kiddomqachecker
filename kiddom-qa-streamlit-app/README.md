@@ -13,6 +13,8 @@ browser, and download fully quoted Kiddom import CSVs.
 - An optional Jira Cloud workspace for finding reviewers and their assigned
   tickets
 - Direct, authenticated loading of HTML attachments from Jira tickets
+- One-click loading of Issue Annotation Report HTML files from GitHub Actions
+  run links in Jira tickets
 - A confirmed completion handoff that attaches the final CSV, moves the ticket
   to the configured QA status, and reassigns it to the QA owner
 - The same math, spelling, capitalization, spacing, punctuation, proper-noun,
@@ -37,8 +39,9 @@ browser, and download fully quoted Kiddom import CSVs.
 ## Reviewer quick start
 
 1. Open **1 · Get a report from Jira**.
-2. Choose your name, assigned ticket, and Issue Annotation Report.
-3. Select **Load report and start review**.
+2. Choose your name and assigned ticket.
+3. Select **Load report and start review** for a Jira attachment, or **Load
+   report directly from GitHub** for a linked workflow run.
 4. In **2 · Review items**, compare the original and proposed text:
    - **Approved** means the proposed correction is right.
    - **Rejected** means the original is right.
@@ -199,17 +202,18 @@ Jira is optional. When configured, reviewers can:
 1. Open **Jira tickets** in the app.
 2. Choose Karin, Steve, Janelle, Mike, or Mikayla from the reviewer list.
 3. See open tickets assigned to that person, optionally limited to one project.
-4. Open ticket links, use Jira's available status transitions, reassign the
-   ticket, or load an attached `.html` / `.htm` report
-   directly into the existing QA review pipeline.
+4. Use Jira's available status transitions, reassign the ticket, or load a
+   report directly from a Jira attachment or linked GitHub Actions run.
 5. Complete every human-review decision.
 6. In **Exports**, explicitly confirm the Jira handoff.
 7. Let the app attach the training-safe final CSV, transition the ticket to the
    configured QA status, and reassign it to the configured QA owner.
 
 The app never fetches arbitrary external ticket links on the server. Jira HTML
-attachments are downloaded through Jira's authenticated attachment endpoint;
-other links are presented for the reviewer to open.
+attachments use Jira's authenticated attachment endpoint. A recognized
+`github.com/{owner}/{repo}/actions/runs/{run_id}` link uses GitHub's
+authenticated Actions artifact API. Other links remain available for the
+reviewer to open.
 
 For an internal team deployment, create a dedicated Jira service account with
 only the projects and actions this workflow needs. Copy
@@ -232,6 +236,9 @@ max_results = 50
 # Steve = "712020:steve-account-id"
 # Janelle = "712020:janelle-account-id"
 # Mike = "712020:mike-account-id"
+
+[github]
+token = "github_pat_replace-with-a-read-only-token"
 ```
 
 The equivalent environment variables are:
@@ -240,6 +247,14 @@ The equivalent environment variables are:
 - recommended: `JIRA_PROJECT_KEY`, `JIRA_QA_ACCOUNT_ID`
 - optional: `JIRA_READY_FOR_QA_STATUS`, `JIRA_MAX_RESULTS`,
   `JIRA_TICKET_JQL`
+
+For direct GitHub loading, create a fine-grained token limited to the
+repositories containing QA workflow runs. Grant only **Actions: Read-only**,
+authorize it for the Kiddom organization if SSO is enforced, and save it as
+`[github].token` or `GITHUB_TOKEN`. The token stays server-side. The app lists
+the run's non-expired artifacts, downloads the most likely QA artifact, and
+loads the Issue Annotation Report HTML. If one artifact contains multiple
+course reports, the reviewer chooses the report inside the app.
 
 `JIRA_TICKET_JQL` can replace the default
 `project + assignee + not-done` query. It supports `{account_id}` and

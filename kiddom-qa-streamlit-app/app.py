@@ -41,6 +41,13 @@ from decision_memory import (
     shared_pattern_evidence,
     store_report_snapshot,
 )
+from github_integration import (
+    GitHubActionsClient,
+    GitHubConfig,
+    GitHubIntegrationError,
+    GitHubRunRef,
+    github_run_refs,
+)
 from jira_integration import (
     JiraClient,
     JiraConfig,
@@ -361,6 +368,8 @@ def initialize_state(user: UserIdentity) -> None:
         st.session_state.jira_reviewer_directory = {}
     if "jira_reviewer_issue_directory" not in st.session_state:
         st.session_state.jira_reviewer_issue_directory = {}
+    if "github_report_candidates" not in st.session_state:
+        st.session_state.github_report_candidates = {}
     if st.session_state.get("active_reviewer_email") != user.email:
         st.session_state.jira_people = []
         st.session_state.jira_issues = []
@@ -369,6 +378,7 @@ def initialize_state(user: UserIdentity) -> None:
         st.session_state.pop("jira_loaded_reviewer_id", None)
         st.session_state.pop("jira_loaded_reviewer_label", None)
         st.session_state.pop("jira_selected_issue", None)
+        st.session_state.github_report_candidates = {}
         st.session_state.active_reviewer_email = user.email
     if "memory_initialized" not in st.session_state:
         try:
@@ -719,6 +729,68 @@ def add_report_payload(
     }
 
 
+def activate_loaded_report(result: dict) -> None:
+    """Show processing results and move the reviewer into the review flow."""
+    st.session_state.processing_flash = {
+        **result["memory"],
+        "reports": int(result["library_saved"]),
+        "findings": result["stored_findings"],
+        "automatic_rules_learned": result["automatic_rules_learned"],
+    }
+    if result["library_error"]:
+        st.session_state.jira_load_warning = result["library_error"]
+    st.session_state.requested_primary_workspace = "Review workspace"
+
+
+GITHUB_SETTING_NAMES = (
+    "GITHUB_TOKEN",
+    "GITHUB_API_URL",
+    "GITHUB_MAX_ARTIFACT_BYTES",
+    "GITHUB_MAX_REPORT_BYTES",
+)
+
+
+def github_configuration() -> tuple[GitHubConfig | None, str]:
+    values: dict[str, object] = {
+        name: os.environ.get(name, "") for name in GITHUB_SETTING_NAMES
+    }
+    try:
+        nested = st.secrets.get("github", {})
+        for name in GITHUB_SETTING_NAMES:
+            if name in st.secrets:
+                values[name] = st.secrets[name]
+            elif isinstance(nested, Mapping):
+                nested_name = name.removeprefix("GITHUB_").lower()
+                if nested_name in nested:
+                    values[name] = nested[nested_name]
+    except (FileNotFoundError, KeyError):
+        pass
+    try:
+        return GitHubConfig.from_mapping(values), ""
+    except GitHubIntegrationError as error:
+        return None, str(error)
+
+
+def render_github_setup(configuration_error: str) -> None:
+    st.info(configuration_error)
+    st.markdown(
+        """
+        Ask the app administrator to add one read-only GitHub credential in
+        **Streamlit → App settings → Secrets**:
+
+        ```toml
+        [github]
+        token = "github_pat_..."
+        ```
+
+        Use a fine-grained token for the repositories that contain the QA
+        workflow runs, with **Actions: Read-only** permission. If the Kiddom
+        GitHub organization uses SSO, authorize the token for the organization.
+        The token remains server-side and is never shown to reviewers.
+        """
+    )
+
+
 JIRA_SETTING_NAMES = (
     "JIRA_BASE_URL",
     "JIRA_USER_EMAIL",
@@ -1006,6 +1078,117 @@ def render_jira_ticket_actions(client: JiraClient, issue: dict) -> None:
                 st.error(str(error))
 
 
+def render_github_report_loader(
+    issue: dict,
+    refs: list[GitHubRunRef],
+    *,
+    primary: bool,
+) -> None:
+    st.success(
+        "GitHub workflow run found. The report can be loaded here without "
+        "opening GitHub or downloading a file manually."
+    )
+    if len(refs) == 1:
+        selected_ref = refs[0]
+        st.caption(selected_ref.label)
+    else:
+        selected_index = st.selectbox(
+            "GitHub workflow run",
+            options=range(len(refs)),
+            format_func=lambda index: refs[index].label,
+            key=f"github-run-{issue['key']}",
+        )
+        selected_ref = refs[selected_index]
+
+    config, configuration_error = github_configuration()
+    if config is None:
+        render_github_setup(configuration_error)
+        return
+
+    candidate_key = (
+        f"{issue['key']}:{selected_ref.owner}:{selected_ref.repo}:"
+        f"{selected_ref.run_id}"
+    )
+    candidates = st.session_state.github_report_candidates.get(candidate_key, [])
+    if not candidates:
+        if st.button(
+            "Load report directly from GitHub",
+            type="primary" if primary else "secondary",
+            width="stretch",
+            key=f"github-find-report-{candidate_key}",
+        ):
+            try:
+                with st.spinner(
+                    "Reading the workflow artifact and finding the report HTML…"
+                ):
+                    candidates = GitHubActionsClient(config).find_report_files(
+                        selected_ref
+                    )
+                    if len(candidates) == 1:
+                        candidate = candidates[0]
+                        result = add_report_payload(
+                            candidate["filename"],
+                            candidate["payload"],
+                            {
+                                "jira_issue": issue,
+                                "jira_attachment_id": "",
+                                "github_run_url": selected_ref.web_url,
+                                "github_artifact_id": candidate["artifact_id"],
+                                "github_artifact_name": candidate["artifact_name"],
+                            },
+                        )
+                        activate_loaded_report(result)
+                        st.rerun()
+                    st.session_state.github_report_candidates = {
+                        candidate_key: candidates
+                    }
+                    st.rerun()
+            except (
+                GitHubIntegrationError,
+                QAEngineError,
+                UnicodeError,
+                ValueError,
+            ) as error:
+                st.error(str(error))
+        return
+
+    st.caption(
+        f"Found {len(candidates)} Issue Annotation Reports in "
+        f"{candidates[0]['artifact_name']}."
+    )
+    selected_candidate_index = st.selectbox(
+        "Choose the course report",
+        options=range(len(candidates)),
+        format_func=lambda index: candidates[index]["archive_path"],
+        key=f"github-report-file-{candidate_key}",
+    )
+    if st.button(
+        "Load selected report and start review",
+        type="primary",
+        width="stretch",
+        key=f"github-load-report-{candidate_key}",
+    ):
+        candidate = candidates[selected_candidate_index]
+        try:
+            with st.spinner(f"Parsing {candidate['filename']}…"):
+                result = add_report_payload(
+                    candidate["filename"],
+                    candidate["payload"],
+                    {
+                        "jira_issue": issue,
+                        "jira_attachment_id": "",
+                        "github_run_url": selected_ref.web_url,
+                        "github_artifact_id": candidate["artifact_id"],
+                        "github_artifact_name": candidate["artifact_name"],
+                    },
+                )
+            st.session_state.github_report_candidates.pop(candidate_key, None)
+            activate_loaded_report(result)
+            st.rerun()
+        except (QAEngineError, UnicodeError, ValueError) as error:
+            st.error(str(error))
+
+
 def render_jira_workspace(
     config: JiraConfig | None,
     configuration_error: str,
@@ -1185,13 +1368,15 @@ def render_jira_workspace(
         for attachment in issue["attachments"]
         if is_html_attachment(attachment)
     ]
+    github_refs = github_run_refs(issue["links"])
     st.markdown("#### 3. Load the report")
-    if not html_attachments:
+    if not html_attachments and not github_refs:
         st.info(
             "This ticket has no HTML attachment. Open the ticket links below, "
             "download the report, then use **Upload HTML manually** in the sidebar."
         )
-    else:
+    if html_attachments:
+        st.markdown("##### From a Jira attachment")
         attachments_by_id = {
             attachment["id"]: attachment for attachment in html_attachments
         }
@@ -1225,20 +1410,19 @@ def render_jira_workspace(
                         },
                     )
                 del payload
-                st.session_state.processing_flash = {
-                    **result["memory"],
-                    "reports": int(result["library_saved"]),
-                    "findings": result["stored_findings"],
-                    "automatic_rules_learned": result[
-                        "automatic_rules_learned"
-                    ],
-                }
-                if result["library_error"]:
-                    st.session_state.jira_load_warning = result["library_error"]
-                st.session_state.requested_primary_workspace = "Review workspace"
+                activate_loaded_report(result)
                 st.rerun()
             except (JiraIntegrationError, QAEngineError, UnicodeError, ValueError) as error:
                 st.error(str(error))
+
+    if github_refs:
+        if html_attachments:
+            st.markdown("##### Or from the linked GitHub workflow")
+        render_github_report_loader(
+            issue,
+            github_refs,
+            primary=not html_attachments,
+        )
 
     if st.session_state.reports:
         active_report_id = st.session_state.selected_report
