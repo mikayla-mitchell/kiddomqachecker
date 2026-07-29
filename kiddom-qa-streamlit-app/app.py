@@ -263,10 +263,13 @@ def initialize_state(user: UserIdentity) -> None:
         st.session_state.jira_admin_people = []
     if "jira_reviewer_directory" not in st.session_state:
         st.session_state.jira_reviewer_directory = {}
+    if "jira_reviewer_issue_directory" not in st.session_state:
+        st.session_state.jira_reviewer_issue_directory = {}
     if st.session_state.get("active_reviewer_email") != user.email:
         st.session_state.jira_people = []
         st.session_state.jira_issues = []
         st.session_state.jira_reviewer_directory = {}
+        st.session_state.jira_reviewer_issue_directory = {}
         st.session_state.pop("jira_loaded_reviewer_id", None)
         st.session_state.pop("jira_loaded_reviewer_label", None)
         st.session_state.pop("jira_selected_issue", None)
@@ -665,6 +668,35 @@ def render_jira_person_choice(
     return people_by_id[account_id]
 
 
+def jira_candidate_issue_directory(
+    client: JiraClient,
+    label: str,
+    people: list[dict[str, str]],
+    *,
+    refresh: bool = False,
+) -> dict[str, list[dict]]:
+    cache_key = label.strip().casefold()
+    candidate_ids = tuple(person["account_id"] for person in people)
+    cached = st.session_state.jira_reviewer_issue_directory.get(cache_key)
+    if (
+        refresh
+        or not cached
+        or tuple(cached.get("candidate_ids", ())) != candidate_ids
+    ):
+        issues_by_id = {
+            person["account_id"]: client.search_assigned_issues(
+                person["account_id"]
+            )
+            for person in people
+        }
+        cached = {
+            "candidate_ids": candidate_ids,
+            "issues_by_id": issues_by_id,
+        }
+        st.session_state.jira_reviewer_issue_directory[cache_key] = cached
+    return cached["issues_by_id"]
+
+
 def store_refreshed_jira_issue(issue: dict) -> None:
     st.session_state.jira_issues = [
         issue if current["key"] == issue["key"] else current
@@ -740,11 +772,33 @@ def render_jira_workspace(
     except JiraIntegrationError as error:
         st.error(str(error))
         return
-    reviewer = render_jira_person_choice(
-        reviewer_label,
-        reviewer_people,
-        key=f"jira-reviewer-account-{reviewer_label.casefold()}",
-    )
+    issues_by_reviewer_id: dict[str, list[dict]] = {}
+    if len(reviewer_people) > 1:
+        try:
+            with st.spinner(f"Matching {reviewer_label} to their Jira tickets…"):
+                issues_by_reviewer_id = jira_candidate_issue_directory(
+                    client,
+                    reviewer_label,
+                    reviewer_people,
+                    refresh=refresh_clicked,
+                )
+        except JiraIntegrationError as error:
+            st.error(str(error))
+            return
+    reviewers_with_issues = [
+        person
+        for person in reviewer_people
+        if issues_by_reviewer_id.get(person["account_id"])
+    ]
+    if len(reviewers_with_issues) == 1:
+        reviewer = reviewers_with_issues[0]
+        st.caption(f"Jira account: {reviewer['display_name']}")
+    else:
+        reviewer = render_jira_person_choice(
+            reviewer_label,
+            reviewer_people,
+            key=f"jira-reviewer-account-{reviewer_label.casefold()}",
+        )
     if reviewer is None:
         return
 
@@ -757,7 +811,9 @@ def render_jira_workspace(
             with st.spinner(
                 f"Loading Jira tickets for {reviewer['display_name']}…"
             ):
-                st.session_state.jira_issues = client.search_assigned_issues(
+                st.session_state.jira_issues = issues_by_reviewer_id.get(
+                    reviewer["account_id"]
+                ) or client.search_assigned_issues(
                     reviewer["account_id"]
                 )
             st.session_state.jira_people = [reviewer]
@@ -887,14 +943,34 @@ def render_jira_workspace(
         if target_label:
             try:
                 target_people = jira_reviewer_candidates(client, target_label)
-                target_person = render_jira_person_choice(
-                    target_label,
-                    target_people,
-                    key=(
-                        f"jira-target-account-{issue['key']}-"
-                        f"{target_label.casefold()}"
-                    ),
+                target_issue_directory = (
+                    jira_candidate_issue_directory(
+                        client,
+                        target_label,
+                        target_people,
+                    )
+                    if len(target_people) > 1
+                    else {}
                 )
+                targets_with_issues = [
+                    person
+                    for person in target_people
+                    if target_issue_directory.get(person["account_id"])
+                ]
+                if len(targets_with_issues) == 1:
+                    target_person = targets_with_issues[0]
+                    st.caption(
+                        f"Jira account: {target_person['display_name']}"
+                    )
+                else:
+                    target_person = render_jira_person_choice(
+                        target_label,
+                        target_people,
+                        key=(
+                            f"jira-target-account-{issue['key']}-"
+                            f"{target_label.casefold()}"
+                        ),
+                    )
             except JiraIntegrationError as error:
                 st.error(str(error))
         already_assigned = bool(
