@@ -579,7 +579,6 @@ def jira_configuration() -> tuple[JiraConfig | None, str]:
         return None, str(error)
 
 
-@st.cache_resource
 def jira_client(config: JiraConfig) -> JiraClient:
     return JiraClient(config)
 
