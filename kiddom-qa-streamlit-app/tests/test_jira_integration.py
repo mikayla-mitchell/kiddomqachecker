@@ -168,6 +168,35 @@ def test_google_identity_resolves_to_exact_jira_user():
     assert reviewer["account_id"] == "reviewer-1"
 
 
+def test_short_reviewer_name_prefers_active_first_name_matches():
+    session = FakeSession(
+        [
+            FakeResponse(
+                data=[
+                    {
+                        "accountId": "steve-1",
+                        "displayName": "Steve Reviewer",
+                        "active": True,
+                    },
+                    {
+                        "accountId": "stephen-1",
+                        "displayName": "Stephen Reviewer",
+                        "active": True,
+                    },
+                    {
+                        "accountId": "steve-old",
+                        "displayName": "Steve Former",
+                        "active": False,
+                    },
+                ]
+            )
+        ]
+    )
+    people = JiraClient(config(), session=session).search_named_users("Steve")
+
+    assert [person["account_id"] for person in people] == ["steve-1"]
+
+
 def test_ambiguous_google_identity_requires_admin_mapping():
     session = FakeSession(
         [
@@ -270,6 +299,31 @@ def test_completed_handoff_attaches_transitions_and_reassigns():
     assert attachment_call[2]["files"]["file"][0] == "result.csv"
     assert session.calls[3][2]["json"] == {"transition": {"id": "31"}}
     assert session.calls[4][2]["json"] == {"accountId": "qa-123"}
+
+
+def test_transition_by_id_uses_current_jira_options():
+    session = FakeSession(
+        [
+            FakeResponse(
+                data={
+                    "transitions": [
+                        {
+                            "id": "41",
+                            "name": "Start work",
+                            "to": {"name": "In Progress"},
+                        }
+                    ]
+                }
+            ),
+            FakeResponse(status_code=204),
+        ]
+    )
+    client = JiraClient(config(), session=session)
+
+    result = client.transition_issue_by_id("CURR-42", "41")
+
+    assert result == "In Progress"
+    assert session.calls[1][2]["json"] == {"transition": {"id": "41"}}
 
 
 def test_handoff_retry_skips_already_completed_actions():
