@@ -8,6 +8,7 @@ from jira_integration import (
     JiraHandoffError,
     JiraIntegrationError,
     is_html_attachment,
+    is_qa_report_issue,
     normalize_issue,
 )
 
@@ -260,11 +261,42 @@ def test_normalize_issue_extracts_adf_links_and_attachment_metadata():
     assert issue["browse_url"].endswith("/browse/CURR-42")
 
 
+def test_qa_report_issue_detection_prefers_direct_sources_and_report_language():
+    assert is_qa_report_issue(
+        {
+            "summary": "Curriculum work",
+            "description": "",
+            "links": [
+                "https://github.com/ayo-kiddom/content-enhancement-agent/"
+                "actions/runs/123"
+            ],
+            "attachments": [],
+        }
+    )
+    assert is_qa_report_issue(
+        {
+            "summary": "Grade 2 QA Report Review",
+            "description": "",
+            "links": [],
+            "attachments": [],
+        }
+    )
+    assert not is_qa_report_issue(
+        {
+            "summary": "Update curriculum metadata",
+            "description": "Routine ticket",
+            "links": ["https://example.test"],
+            "attachments": [],
+        }
+    )
+
+
 def test_completed_handoff_attaches_transitions_and_reassigns():
     session = FakeSession(
         [
             FakeResponse(data=raw_issue()),
             FakeResponse(data=[{"id": "9002", "filename": "result.csv"}]),
+            FakeResponse(status_code=204),
             FakeResponse(
                 data={
                     "transitions": [
@@ -276,7 +308,6 @@ def test_completed_handoff_attaches_transitions_and_reassigns():
                     ]
                 }
             ),
-            FakeResponse(status_code=204),
             FakeResponse(status_code=204),
         ]
     )
@@ -291,14 +322,66 @@ def test_completed_handoff_attaches_transitions_and_reassigns():
 
     assert [step["result"] for step in steps] == [
         "Attached",
-        "Moved to Ready for QA",
         "Reassigned",
+        "Moved to Ready for QA",
     ]
     attachment_call = session.calls[1]
     assert attachment_call[2]["headers"]["X-Atlassian-Token"] == "no-check"
     assert attachment_call[2]["files"]["file"][0] == "result.csv"
-    assert session.calls[3][2]["json"] == {"transition": {"id": "31"}}
-    assert session.calls[4][2]["json"] == {"accountId": "qa-123"}
+    assert session.calls[2][2]["json"] == {"accountId": "qa-123"}
+    assert session.calls[4][2]["json"] == {"transition": {"id": "31"}}
+
+
+def test_completed_handoff_comments_all_findings_csv_before_reassignment():
+    session = FakeSession(
+        [
+            FakeResponse(data=raw_issue()),
+            FakeResponse(
+                data=[
+                    {
+                        "id": "9002",
+                        "filename": "result.csv",
+                        "content": "https://example.atlassian.net/attachment/9002",
+                    }
+                ]
+            ),
+            FakeResponse(data={"comments": []}),
+            FakeResponse(status_code=201, data={"id": "7002"}),
+            FakeResponse(status_code=204),
+            FakeResponse(
+                data={
+                    "transitions": [
+                        {
+                            "id": "31",
+                            "name": "Send to QA",
+                            "to": {"name": "Ready for QA"},
+                        }
+                    ]
+                }
+            ),
+            FakeResponse(status_code=204),
+        ]
+    )
+    steps = JiraClient(config(), session=session).handoff_completed_review(
+        "CURR-42",
+        "result.csv",
+        b"csv",
+        "qa-123",
+        "Ready for QA",
+        comment_text="All 10 findings are included.",
+        comment_marker="[KIDDOM-QA-FINAL:abc123]",
+    )
+    assert [step["result"] for step in steps] == [
+        "Attached",
+        "Commented",
+        "Reassigned",
+        "Moved to Ready for QA",
+    ]
+    assert session.calls[3][0] == "POST"
+    assert session.calls[3][1].endswith("/issue/CURR-42/comment")
+    assert "All 10 findings" in str(session.calls[3][2]["json"])
+    assert session.calls[4][1].endswith("/issue/CURR-42/assignee")
+    assert session.calls[6][1].endswith("/issue/CURR-42/transitions")
 
 
 def test_transition_by_id_uses_current_jira_options():
@@ -353,8 +436,8 @@ def test_handoff_retry_skips_already_completed_actions():
     )
     assert [step["result"] for step in steps] == [
         "Already attached",
-        "Already Ready for QA",
         "Already assigned",
+        "Already Ready for QA",
     ]
     assert len(session.calls) == 1
 
@@ -380,3 +463,92 @@ def test_partial_handoff_reports_completed_steps():
         {"step": "CSV attachment", "result": "Attached"}
     ]
     assert "No permission" in str(caught.value)
+
+
+def test_source_report_attachment_and_comment_are_retry_safe():
+    marker = "[KIDDOM-QA-SOURCE:abc123]"
+    session = FakeSession(
+        [
+            FakeResponse(data=raw_issue()),
+            FakeResponse(
+                data=[
+                    {
+                        "id": "9003",
+                        "filename": "source.html",
+                        "content": "https://example.atlassian.net/attachment/9003",
+                    }
+                ]
+            ),
+            FakeResponse(data={"comments": []}),
+            FakeResponse(status_code=201, data={"id": "7001"}),
+        ]
+    )
+    steps = JiraClient(config(), session=session).ensure_file_comment(
+        "CURR-42",
+        "source.html",
+        b"<html>report</html>",
+        mime_type="text/html",
+        comment_text="Source from https://github.com/example/run",
+        comment_marker=marker,
+        attachment_step="Source HTML",
+        comment_step="Source comment",
+    )
+    assert [step["result"] for step in steps] == ["Attached", "Commented"]
+    comment_payload = session.calls[3][2]["json"]
+    assert comment_payload["body"]["type"] == "doc"
+    assert marker in str(comment_payload)
+    assert '"type": "link"' in str(comment_payload).replace("'", '"')
+
+    retry_session = FakeSession(
+        [
+            FakeResponse(
+                data=raw_issue(
+                    attachments=[
+                        {
+                            "id": "9003",
+                            "filename": "source.html",
+                            "mimeType": "text/html",
+                        }
+                    ]
+                )
+            ),
+            FakeResponse(
+                data={
+                    "comments": [
+                        {
+                            "id": "7001",
+                            "body": {
+                                "type": "doc",
+                                "content": [
+                                    {
+                                        "type": "paragraph",
+                                        "content": [
+                                            {"type": "text", "text": marker}
+                                        ],
+                                    }
+                                ],
+                            },
+                        }
+                    ]
+                }
+            ),
+        ]
+    )
+    retry_steps = JiraClient(
+        config(),
+        session=retry_session,
+    ).ensure_file_comment(
+        "CURR-42",
+        "source.html",
+        b"<html>report</html>",
+        mime_type="text/html",
+        comment_text="Source",
+        comment_marker=marker,
+        attachment_step="Source HTML",
+        comment_step="Source comment",
+    )
+    assert [step["result"] for step in retry_steps] == [
+        "Already attached",
+        "Already commented",
+    ]
+    assert len(retry_session.calls) == 2
