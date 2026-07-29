@@ -79,6 +79,12 @@ MEMORY_PATH = Path(
 ).expanduser()
 DECISION_OPTIONS = ["", "approved", "rejected", "needs_change"]
 JIRA_REVIEWER_NAMES = ("Karin", "Steve", "Janelle", "Mike")
+JIRA_REVIEWER_SEARCH_QUERIES = {
+    "karin": "Karin Hutchinson",
+    "steve": "steve.masceri",
+    "janelle": "Janelle Engle",
+    "mike": "Mike Blasberg",
+}
 
 
 st.set_page_config(
@@ -630,7 +636,9 @@ def jira_reviewer_candidates(
         directory[cache_key] = people
         return people
     if refresh or cache_key not in directory:
-        directory[cache_key] = client.search_named_users(label)
+        directory[cache_key] = client.search_named_users(
+            JIRA_REVIEWER_SEARCH_QUERIES.get(cache_key, label)
+        )
     return directory[cache_key]
 
 
