@@ -283,6 +283,35 @@ class JiraClient:
             if isinstance(item, Mapping) and item.get("accountId")
         ]
 
+    def search_named_users(self, name: str) -> list[dict[str, str]]:
+        """Return active Jira users ranked for a short reviewer name."""
+        needle = name.strip().casefold()
+        if not needle:
+            return []
+        people = [person for person in self.search_users(name) if person["active"]]
+        exact = [
+            person
+            for person in people
+            if person["display_name"].strip().casefold() == needle
+        ]
+        first_name = [
+            person
+            for person in people
+            if person["display_name"].strip().casefold().split(" ", 1)[0] == needle
+        ]
+        word_match = [
+            person
+            for person in people
+            if needle in person["display_name"].strip().casefold().split()
+        ]
+        ranked = exact or first_name or word_match or people
+        return list(
+            {
+                person["account_id"]: person
+                for person in ranked
+            }.values()
+        )
+
     def find_user_for_identity(self, email: str, name: str = "") -> dict[str, str]:
         normalized_email = email.strip().casefold()
         normalized_name = name.strip().casefold()
@@ -458,7 +487,33 @@ class JiraClient:
             raise JiraIntegrationError(
                 f'No Jira transition leads to "{target_status}".{hint}'
             )
-        transition_id = str(match.get("id") or "")
+        return self._execute_transition(issue_key, match)
+
+    def transition_issue_by_id(self, issue_key: str, transition_id: str) -> str:
+        transitions = self.get_transitions(issue_key)
+        match = next(
+            (
+                transition
+                for transition in transitions
+                if str(transition.get("id") or "") == str(transition_id)
+            ),
+            None,
+        )
+        if match is None:
+            raise JiraIntegrationError(
+                "That Jira status transition is no longer available. "
+                "Refresh the ticket and try again."
+            )
+        return self._execute_transition(issue_key, match)
+
+    def _execute_transition(
+        self,
+        issue_key: str,
+        transition: Mapping[str, Any],
+    ) -> str:
+        transition_id = str(transition.get("id") or "")
+        if not transition_id:
+            raise JiraIntegrationError("Jira returned a transition without an ID.")
         self._request(
             "POST",
             f"/rest/api/3/issue/{quote(issue_key, safe='-')}/transitions",
@@ -466,7 +521,11 @@ class JiraClient:
             headers={"Content-Type": "application/json"},
             json={"transition": {"id": transition_id}},
         )
-        return str((match.get("to") or {}).get("name") or match.get("name") or "")
+        return str(
+            (transition.get("to") or {}).get("name")
+            or transition.get("name")
+            or ""
+        )
 
     def assign_issue(self, issue_key: str, account_id: str) -> None:
         self._request(

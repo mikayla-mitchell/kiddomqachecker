@@ -150,23 +150,14 @@ server_metadata_url = "https://accounts.google.com/.well-known/openid-configurat
 [access]
 allowed_email_domains = ["kiddom.co"]
 admin_emails = ["app-owner@kiddom.co"]
-jira_reviewer_mode = "self"
 ```
 
 The redirect URI must match in Google Cloud and Streamlit Secrets character for
 character. Save the secrets, reboot the app, and open it in a private browser
 window to verify the Google sign-in screen and domain restriction.
 
-With `jira_reviewer_mode = "self"`, the app resolves the signed-in Google email
-to the corresponding Jira Cloud user and loads that person's assigned tickets.
-Listed app administrators also get a control for opening another reviewer's
-tickets. If Jira hides email addresses or returns an ambiguous result, map only
-those users explicitly:
-
-```toml
-[jira_user_map]
-"reviewer@kiddom.co" = "712020:their-jira-cloud-account-id"
-```
+After sign-in, the Jira workspace presents the shared reviewer list: Karin,
+Steve, Janelle, and Mike. Selecting a name loads that person's open tickets.
 
 Local development remains available without `[auth]` and is labeled as local
 development mode. Do not share a production deployment until its Google auth
@@ -177,9 +168,10 @@ secrets are configured.
 Jira is optional. When configured, reviewers can:
 
 1. Open **Jira tickets** in the app.
-2. Have their signed-in Google Workspace identity matched to Jira.
-3. See open tickets assigned to them, optionally limited to one project.
-4. Open links from the ticket or load an attached `.html` / `.htm` report
+2. Choose Karin, Steve, Janelle, or Mike from the reviewer list.
+3. See open tickets assigned to that person, optionally limited to one project.
+4. Open ticket links, use Jira's available status transitions, reassign the
+   ticket, or load an attached `.html` / `.htm` report
    directly into the existing QA review pipeline.
 5. Complete every human-review decision.
 6. In **Exports**, explicitly confirm the Jira handoff.
@@ -204,6 +196,13 @@ project_key = "PMIM"
 ready_for_qa_status = "Ready for QA"
 qa_account_id = "..."
 max_results = 50
+
+[jira_reviewers]
+# Optional exact account IDs when Jira finds more than one matching user.
+# Karin = "712020:karin-account-id"
+# Steve = "712020:steve-account-id"
+# Janelle = "712020:janelle-account-id"
+# Mike = "712020:mike-account-id"
 ```
 
 The equivalent environment variables are:

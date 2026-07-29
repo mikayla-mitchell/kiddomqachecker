@@ -9,6 +9,7 @@ import zipfile
 from collections import Counter
 from collections.abc import Mapping
 from pathlib import Path
+from urllib.parse import urlparse
 
 import pandas as pd
 import streamlit as st
@@ -77,6 +78,7 @@ MEMORY_PATH = Path(
     or str(APP_DIR / "data" / "shared_memory.sqlite3")
 ).expanduser()
 DECISION_OPTIONS = ["", "approved", "rejected", "needs_change"]
+JIRA_REVIEWER_NAMES = ("Karin", "Steve", "Janelle", "Mike")
 
 
 st.set_page_config(
@@ -233,6 +235,15 @@ def jira_account_mapping() -> dict[str, str]:
     }
 
 
+def jira_reviewer_mapping() -> dict[str, str]:
+    section = _secret_section("jira_reviewers")
+    return {
+        str(label).strip().casefold(): str(account_id).strip()
+        for label, account_id in section.items()
+        if str(label).strip() and str(account_id).strip()
+    }
+
+
 def initialize_state(user: UserIdentity) -> None:
     if "rules" not in st.session_state:
         st.session_state.rules = load_rules(BASE_RULES_PATH)
@@ -250,9 +261,14 @@ def initialize_state(user: UserIdentity) -> None:
         st.session_state.jira_qa_people = []
     if "jira_admin_people" not in st.session_state:
         st.session_state.jira_admin_people = []
+    if "jira_reviewer_directory" not in st.session_state:
+        st.session_state.jira_reviewer_directory = {}
     if st.session_state.get("active_reviewer_email") != user.email:
         st.session_state.jira_people = []
         st.session_state.jira_issues = []
+        st.session_state.jira_reviewer_directory = {}
+        st.session_state.pop("jira_loaded_reviewer_id", None)
+        st.session_state.pop("jira_loaded_reviewer_label", None)
         st.session_state.pop("jira_selected_issue", None)
         st.session_state.active_reviewer_email = user.email
     if "memory_initialized" not in st.session_state:
@@ -591,17 +607,95 @@ def render_jira_setup(configuration_error: str) -> None:
     )
 
 
+def jira_reviewer_candidates(
+    client: JiraClient,
+    label: str,
+    *,
+    refresh: bool = False,
+) -> list[dict[str, str]]:
+    directory = st.session_state.jira_reviewer_directory
+    cache_key = label.strip().casefold()
+    mapped_account_id = jira_reviewer_mapping().get(cache_key)
+    if mapped_account_id:
+        people = [
+            {
+                "account_id": mapped_account_id,
+                "display_name": label,
+                "email": "",
+                "active": True,
+            }
+        ]
+        directory[cache_key] = people
+        return people
+    if refresh or cache_key not in directory:
+        directory[cache_key] = client.search_named_users(label)
+    return directory[cache_key]
+
+
+def render_jira_person_choice(
+    label: str,
+    people: list[dict[str, str]],
+    *,
+    key: str,
+) -> dict[str, str] | None:
+    if not people:
+        st.error(f'Jira could not find an active user named "{label}".')
+        return None
+    if len(people) == 1:
+        person = people[0]
+        st.caption(f"Jira account: {person['display_name']}")
+        return person
+    people_by_id = {person["account_id"]: person for person in people}
+    account_id = st.selectbox(
+        f"Jira account for {label}",
+        options=list(people_by_id),
+        format_func=lambda candidate_id: (
+            people_by_id[candidate_id]["display_name"]
+            + (
+                f" · {people_by_id[candidate_id]['email']}"
+                if people_by_id[candidate_id]["email"]
+                else ""
+            )
+        ),
+        key=key,
+        help=(
+            f'Jira found more than one active user matching "{label}". '
+            "Choose the intended account before continuing."
+        ),
+    )
+    return people_by_id[account_id]
+
+
+def store_refreshed_jira_issue(issue: dict) -> None:
+    st.session_state.jira_issues = [
+        issue if current["key"] == issue["key"] else current
+        for current in st.session_state.jira_issues
+    ]
+    st.session_state.jira_selected_issue = issue
+
+
+def jira_link_label(link: str, index: int) -> str:
+    parsed = urlparse(link)
+    path = parsed.path.rstrip("/")
+    detail = path.rsplit("/", 1)[-1] if path else ""
+    label = parsed.netloc.removeprefix("www.")
+    if detail and len(detail) <= 44:
+        label += f" · {detail}"
+    return label or f"Ticket link {index}"
+
+
 def render_jira_workspace(
     config: JiraConfig | None,
     configuration_error: str,
     user: UserIdentity,
 ) -> None:
+    del user
     st.markdown("### Jira ticket workspace")
     st.markdown(
         """
-        Open your assigned curriculum tickets and load an attached Issue
-        Annotation Report directly into this app. Links in the ticket remain
-        available to open in a new tab.
+        Choose a reviewer to see their open Jira tickets. Open ticket links,
+        change status, reassign work, or load an attached Issue Annotation
+        Report without leaving this workspace.
         """
     )
     if config is None:
@@ -609,120 +703,79 @@ def render_jira_workspace(
         return
     client = jira_client(config)
 
-    connection_col, scope_col = st.columns([1, 2])
-    if connection_col.button("Test Jira connection"):
-        try:
-            identity = client.test_connection()
-            st.success(f"Connected as {identity['display_name']}.")
-        except JiraIntegrationError as error:
-            st.error(str(error))
-    scope_col.caption(
+    st.caption(
         f"Ticket scope: project {config.project_key}"
         if config.project_key
         else "Ticket scope: all visible Jira projects"
     )
 
-    access = access_configuration()
-    self_service = (
-        user.is_authenticated and access["jira_reviewer_mode"] == "self"
-    )
-
-    if self_service:
-        st.markdown(f"**Reviewer:** {user.name} · {user.email}")
-        first_lookup = (
-            st.session_state.get("jira_self_lookup_email") != user.email
+    reviewer_col, refresh_col = st.columns([3, 1])
+    with reviewer_col:
+        reviewer_label = st.selectbox(
+            "Whose tickets do you want to open?",
+            options=JIRA_REVIEWER_NAMES,
+            index=None,
+            placeholder="Choose Karin, Steve, Janelle, or Mike",
+            key="jira-directory-reviewer",
         )
-        retry_lookup = st.button(
-            "Refresh my assigned tickets",
+    with refresh_col:
+        st.write("")
+        refresh_clicked = st.button(
+            "Refresh tickets",
             type="primary",
-            key="jira-refresh-self",
+            width="stretch",
+            disabled=reviewer_label is None,
+            key="jira-refresh-directory",
         )
-        if first_lookup or retry_lookup:
-            st.session_state.jira_self_lookup_email = user.email
-            st.session_state.jira_self_lookup_error = ""
-            try:
-                account_id = jira_account_mapping().get(user.email)
-                if account_id:
-                    reviewer = {
-                        "account_id": account_id,
-                        "display_name": user.name,
-                        "email": user.email,
-                        "active": True,
-                    }
-                else:
-                    reviewer = client.find_user_for_identity(
-                        user.email, user.name
-                    )
-                with st.spinner(f"Loading Jira tickets for {reviewer['display_name']}…"):
-                    st.session_state.jira_people = [reviewer]
-                    st.session_state.jira_issues = client.search_assigned_issues(
-                        reviewer["account_id"]
-                    )
-            except JiraIntegrationError as error:
-                st.session_state.jira_issues = []
-                st.session_state.jira_self_lookup_error = str(error)
-        if st.session_state.get("jira_self_lookup_error"):
-            st.error(st.session_state.jira_self_lookup_error)
 
-    manual_search_allowed = not self_service or user.is_admin
-    if manual_search_allowed:
-        container = (
-            st.expander("Administrator: open another reviewer's tickets")
-            if self_service
-            else st.container()
+    if reviewer_label is None:
+        st.info("Choose a reviewer to load their assigned Jira tickets.")
+        return
+
+    try:
+        reviewer_people = jira_reviewer_candidates(
+            client,
+            reviewer_label,
+            refresh=refresh_clicked,
         )
-        with container:
-            with st.form("jira-reviewer-search"):
-                reviewer_query = st.text_input(
-                    "Find a reviewer",
-                    placeholder="Start typing a Jira display name or email",
-                )
-                reviewer_search_clicked = st.form_submit_button(
-                    "Search Jira people",
-                    disabled=not reviewer_query.strip(),
-                )
-            if reviewer_search_clicked:
-                try:
-                    st.session_state.jira_admin_people = client.search_users(
-                        reviewer_query
-                    )
-                except JiraIntegrationError as error:
-                    st.error(str(error))
+    except JiraIntegrationError as error:
+        st.error(str(error))
+        return
+    reviewer = render_jira_person_choice(
+        reviewer_label,
+        reviewer_people,
+        key=f"jira-reviewer-account-{reviewer_label.casefold()}",
+    )
+    if reviewer is None:
+        return
 
-            people = st.session_state.get("jira_admin_people", [])
-            if people:
-                people_by_id = {
-                    person["account_id"]: person for person in people
-                }
-                reviewer_id = st.selectbox(
-                    "Reviewer",
-                    options=list(people_by_id),
-                    format_func=lambda account_id: (
-                        people_by_id[account_id]["display_name"]
-                        + (
-                            f" · {people_by_id[account_id]['email']}"
-                            if people_by_id[account_id]["email"]
-                            else ""
-                        )
-                    ),
-                    key="jira-reviewer",
+    reviewer_changed = (
+        st.session_state.get("jira_loaded_reviewer_id")
+        != reviewer["account_id"]
+    )
+    if reviewer_changed or refresh_clicked:
+        try:
+            with st.spinner(
+                f"Loading Jira tickets for {reviewer['display_name']}…"
+            ):
+                st.session_state.jira_issues = client.search_assigned_issues(
+                    reviewer["account_id"]
                 )
-                if st.button(
-                    "Find assigned tickets",
-                    type="primary",
-                    key="jira-find-assigned",
-                ):
-                    try:
-                        st.session_state.jira_issues = (
-                            client.search_assigned_issues(reviewer_id)
-                        )
-                    except JiraIntegrationError as error:
-                        st.error(str(error))
+            st.session_state.jira_people = [reviewer]
+            st.session_state.jira_loaded_reviewer_id = reviewer["account_id"]
+            st.session_state.jira_loaded_reviewer_label = reviewer_label
+            if reviewer_changed:
+                st.session_state.pop("jira-issue", None)
+                st.session_state.pop("jira_selected_issue", None)
+        except JiraIntegrationError as error:
+            st.session_state.jira_issues = []
+            st.error(str(error))
+            return
 
     issues = st.session_state.jira_issues
     if not issues:
-        if not st.session_state.get("jira_self_lookup_error"):
-            st.info("No matching open Jira tickets are currently assigned.")
+        st.info(f"No open {config.project_key or 'Jira'} tickets are assigned to "
+                f"{reviewer['display_name']}.")
         return
 
     issues_by_key = {issue["key"]: issue for issue in issues}
@@ -738,7 +791,13 @@ def render_jira_workspace(
     issue = issues_by_key[issue_key]
     st.session_state.jira_selected_issue = issue
 
-    ticket_col, status_col, assignee_col = st.columns([1, 1, 1])
+    flash = st.session_state.pop("jira_action_flash", None)
+    if flash:
+        st.success(flash)
+
+    ticket_col, status_col, assignee_col, refresh_ticket_col = st.columns(
+        [1.3, 1, 1, 1]
+    )
     ticket_col.link_button(
         f"Open {issue['key']} in Jira",
         issue["browse_url"],
@@ -746,7 +805,123 @@ def render_jira_workspace(
     )
     status_col.metric("Status", issue["status"] or "Unknown")
     assignee_col.metric("Assignee", issue["assignee_name"] or "Unassigned")
+    if refresh_ticket_col.button(
+        "Refresh ticket",
+        width="stretch",
+        key=f"jira-refresh-ticket-{issue['key']}",
+    ):
+        try:
+            refreshed_issue = client.get_issue(issue["key"])
+            store_refreshed_jira_issue(refreshed_issue)
+            st.session_state.jira_action_flash = (
+                f"Refreshed {refreshed_issue['key']} from Jira."
+            )
+            st.rerun()
+        except JiraIntegrationError as error:
+            st.error(str(error))
+
     st.markdown(f"**{issue['summary']}**")
+    if issue["updated"]:
+        st.caption(f"Last updated in Jira: {issue['updated']}")
+
+    st.markdown("#### Ticket actions")
+    action_status_col, action_assignee_col = st.columns(2)
+    with action_status_col:
+        try:
+            transitions = client.get_transitions(issue["key"])
+        except JiraIntegrationError as error:
+            transitions = []
+            st.error(str(error))
+        transitions_by_id = {
+            str(item.get("id") or ""): item
+            for item in transitions
+            if item.get("id")
+        }
+        transition_id = st.selectbox(
+            "Change status",
+            options=list(transitions_by_id),
+            index=None,
+            placeholder=(
+                "Choose an available Jira status"
+                if transitions_by_id
+                else "No status changes are available"
+            ),
+            format_func=lambda item_id: (
+                str(transitions_by_id[item_id].get("name") or "Move")
+                + " → "
+                + str(
+                    (transitions_by_id[item_id].get("to") or {}).get("name")
+                    or "Unknown"
+                )
+            ),
+            disabled=not transitions_by_id,
+            key=f"jira-transition-{issue['key']}",
+        )
+        if st.button(
+            "Update status",
+            type="primary",
+            width="stretch",
+            disabled=transition_id is None,
+            key=f"jira-update-status-{issue['key']}",
+        ):
+            try:
+                new_status = client.transition_issue_by_id(
+                    issue["key"],
+                    transition_id,
+                )
+                store_refreshed_jira_issue(client.get_issue(issue["key"]))
+                st.session_state.jira_action_flash = (
+                    f"Moved {issue['key']} to {new_status}."
+                )
+                st.rerun()
+            except JiraIntegrationError as error:
+                st.error(str(error))
+
+    with action_assignee_col:
+        target_label = st.selectbox(
+            "Reassign to",
+            options=JIRA_REVIEWER_NAMES,
+            index=None,
+            placeholder="Choose Karin, Steve, Janelle, or Mike",
+            key=f"jira-target-label-{issue['key']}",
+        )
+        target_person = None
+        if target_label:
+            try:
+                target_people = jira_reviewer_candidates(client, target_label)
+                target_person = render_jira_person_choice(
+                    target_label,
+                    target_people,
+                    key=(
+                        f"jira-target-account-{issue['key']}-"
+                        f"{target_label.casefold()}"
+                    ),
+                )
+            except JiraIntegrationError as error:
+                st.error(str(error))
+        already_assigned = bool(
+            target_person
+            and target_person["account_id"] == issue["assignee_account_id"]
+        )
+        if already_assigned:
+            st.caption(f"{issue['key']} is already assigned to this person.")
+        if st.button(
+            "Reassign ticket",
+            width="stretch",
+            disabled=target_person is None or already_assigned,
+            key=f"jira-reassign-{issue['key']}",
+        ):
+            try:
+                client.assign_issue(issue["key"], target_person["account_id"])
+                store_refreshed_jira_issue(client.get_issue(issue["key"]))
+                st.session_state.jira_action_flash = (
+                    f"Reassigned {issue['key']} to "
+                    f"{target_person['display_name']}."
+                )
+                st.rerun()
+            except JiraIntegrationError as error:
+                st.error(str(error))
+
     if issue["description"]:
         with st.expander("Ticket description"):
             st.write(issue["description"])
@@ -832,7 +1007,11 @@ def render_jira_workspace(
     if issue["links"]:
         st.markdown("#### Links from the ticket")
         for index, link in enumerate(issue["links"], start=1):
-            st.link_button(f"Open ticket link {index}", link)
+            st.link_button(
+                jira_link_label(link, index),
+                link,
+                width="stretch",
+            )
 
 
 def render_jira_handoff(
