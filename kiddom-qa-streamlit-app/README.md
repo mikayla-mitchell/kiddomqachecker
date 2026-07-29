@@ -34,6 +34,23 @@ browser, and download fully quoted Kiddom import CSVs.
   spacing, spelling, and recurring valid-term patterns
 - A JSON rulebook that can be version-controlled and synced to the Codex skill
 
+## Reviewer quick start
+
+1. Open **1 · Get a report from Jira**.
+2. Choose your name, assigned ticket, and Issue Annotation Report.
+3. Select **Load report and start review**.
+4. In **2 · Review items**, compare the original and proposed text:
+   - **Approved** means the proposed correction is right.
+   - **Rejected** means the original is right.
+   - **Needs change** means neither version is ready; add the exact correction.
+5. Select **Save these decisions**.
+6. In **3 · Finish and send**, save the learning, download the final CSV, and
+   return it to Jira.
+
+Use **Upload HTML manually** only when the Jira ticket does not contain the
+report. Advanced report history, decision memory, pattern learning, and
+rulebook controls are grouped under **Tools and history**.
+
 ## Run locally
 
 ```bash

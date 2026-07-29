@@ -68,7 +68,6 @@ from qa_engine import (
     review_progress,
     rules_json_bytes,
     safe_report_name,
-    status_counts,
 )
 
 
@@ -91,7 +90,7 @@ JIRA_REVIEWER_SEARCH_QUERIES = {
 
 
 st.set_page_config(
-    page_title="Kiddom QA Review Studio",
+    page_title="Kiddom QA Review",
     page_icon="✓",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -149,10 +148,98 @@ st.markdown(
         color: var(--muted);
         font-size: .9rem;
       }
+      .qa-steps {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: .75rem;
+        margin: .25rem 0 1.25rem;
+      }
+      .qa-step {
+        background: white;
+        border: 1px solid #dfe7ed;
+        border-radius: 12px;
+        color: var(--muted);
+        padding: .8rem .9rem;
+      }
+      .qa-step strong {
+        color: var(--ink);
+        display: block;
+        font-size: .94rem;
+        margin-bottom: .15rem;
+      }
+      .qa-step-active {
+        background: #eef8f7;
+        border-color: var(--teal);
+        box-shadow: 0 0 0 1px var(--teal);
+      }
+      .qa-step-done {
+        background: #f5faf7;
+        border-color: #a9cdbd;
+      }
+      .qa-next-action {
+        background: #fff8f1;
+        border: 1px solid #f1d0b8;
+        border-left: 5px solid var(--coral);
+        border-radius: 10px;
+        color: var(--ink);
+        margin: .75rem 0 1rem;
+        padding: .85rem 1rem;
+      }
+      .qa-next-action strong {
+        display: block;
+        margin-bottom: .2rem;
+      }
+      .qa-decision-guide {
+        background: white;
+        border: 1px solid #dfe7ed;
+        border-radius: 10px;
+        min-height: 112px;
+        padding: .8rem .9rem;
+      }
+      .qa-decision-guide strong {
+        color: var(--ink);
+        display: block;
+        margin-bottom: .3rem;
+      }
+      @media (max-width: 850px) {
+        .qa-steps { grid-template-columns: 1fr; }
+      }
     </style>
     """,
     unsafe_allow_html=True,
 )
+
+
+def render_workflow_steps(active_step: int) -> None:
+    steps = (
+        ("1", "Get the report", "Choose a Jira ticket or upload HTML."),
+        ("2", "Review flagged items", "Decide only the findings that need you."),
+        ("3", "Finish and send", "Download the CSV or return it to Jira."),
+    )
+    cards = []
+    for index, (number, title, detail) in enumerate(steps, start=1):
+        state = (
+            "qa-step-done"
+            if index < active_step
+            else "qa-step-active"
+            if index == active_step
+            else ""
+        )
+        cards.append(
+            f'<div class="qa-step {state}"><strong>{number} · {title}</strong>'
+            f"{detail}</div>"
+        )
+    st.markdown(
+        '<div class="qa-steps">' + "".join(cards) + "</div>",
+        unsafe_allow_html=True,
+    )
+
+
+def render_next_action(title: str, detail: str) -> None:
+    st.markdown(
+        f'<div class="qa-next-action"><strong>{title}</strong>{detail}</div>',
+        unsafe_allow_html=True,
+    )
 
 
 def process_payload(
@@ -800,18 +887,139 @@ def jira_link_label(link: str, index: int) -> str:
     return label or f"Ticket link {index}"
 
 
+def render_jira_ticket_actions(client: JiraClient, issue: dict) -> None:
+    st.caption("These controls update Jira immediately.")
+    action_status_col, action_assignee_col = st.columns(2)
+    with action_status_col:
+        try:
+            transitions = client.get_transitions(issue["key"])
+        except JiraIntegrationError as error:
+            transitions = []
+            st.error(str(error))
+        transitions_by_id = {
+            str(item.get("id") or ""): item
+            for item in transitions
+            if item.get("id")
+        }
+        transition_id = st.selectbox(
+            "Change status",
+            options=list(transitions_by_id),
+            index=None,
+            placeholder=(
+                "Choose an available Jira status"
+                if transitions_by_id
+                else "No status changes are available"
+            ),
+            format_func=lambda item_id: (
+                str(transitions_by_id[item_id].get("name") or "Move")
+                + " → "
+                + str(
+                    (transitions_by_id[item_id].get("to") or {}).get("name")
+                    or "Unknown"
+                )
+            ),
+            disabled=not transitions_by_id,
+            key=f"jira-transition-{issue['key']}",
+        )
+        if st.button(
+            "Update status",
+            width="stretch",
+            disabled=transition_id is None,
+            key=f"jira-update-status-{issue['key']}",
+        ):
+            try:
+                new_status = client.transition_issue_by_id(
+                    issue["key"],
+                    transition_id,
+                )
+                store_refreshed_jira_issue(client.get_issue(issue["key"]))
+                st.session_state.jira_action_flash = (
+                    f"Moved {issue['key']} to {new_status}."
+                )
+                st.rerun()
+            except JiraIntegrationError as error:
+                st.error(str(error))
+
+    with action_assignee_col:
+        target_label = st.selectbox(
+            "Reassign to",
+            options=JIRA_REVIEWER_NAMES,
+            index=None,
+            placeholder="Choose a reviewer",
+            key=f"jira-target-label-{issue['key']}",
+        )
+        target_person = None
+        if target_label:
+            try:
+                target_people = jira_reviewer_candidates(client, target_label)
+                target_issue_directory = (
+                    jira_candidate_issue_directory(
+                        client,
+                        target_label,
+                        target_people,
+                    )
+                    if len(target_people) > 1
+                    else {}
+                )
+                targets_with_issues = [
+                    person
+                    for person in target_people
+                    if target_issue_directory.get(person["account_id"])
+                ]
+                if len(targets_with_issues) == 1:
+                    target_person = targets_with_issues[0]
+                    st.caption(
+                        f"Jira account: {target_person['display_name']}"
+                    )
+                else:
+                    target_person = render_jira_person_choice(
+                        target_label,
+                        target_people,
+                        key=(
+                            f"jira-target-account-{issue['key']}-"
+                            f"{target_label.casefold()}"
+                        ),
+                    )
+            except JiraIntegrationError as error:
+                st.error(str(error))
+        already_assigned = bool(
+            target_person
+            and target_person["account_id"] == issue["assignee_account_id"]
+        )
+        if already_assigned:
+            st.caption(f"{issue['key']} is already assigned to this person.")
+        if st.button(
+            "Reassign ticket",
+            width="stretch",
+            disabled=target_person is None or already_assigned,
+            key=f"jira-reassign-{issue['key']}",
+        ):
+            try:
+                client.assign_issue(issue["key"], target_person["account_id"])
+                store_refreshed_jira_issue(client.get_issue(issue["key"]))
+                st.session_state.jira_action_flash = (
+                    f"Reassigned {issue['key']} to "
+                    f"{target_person['display_name']}."
+                )
+                st.rerun()
+            except JiraIntegrationError as error:
+                st.error(str(error))
+
+
 def render_jira_workspace(
     config: JiraConfig | None,
     configuration_error: str,
     user: UserIdentity,
 ) -> None:
     del user
-    st.markdown("### Jira ticket workspace")
+    st.markdown("### Step 1 · Open your Jira report")
     st.markdown(
         """
-        Choose a reviewer to see their open Jira tickets. Open ticket links,
-        change status, reassign work, or load an attached Issue Annotation
-        Report without leaving this workspace.
+        1. Choose your name.
+        2. Choose the assigned ticket.
+        3. Load its Issue Annotation Report.
+
+        The app will automatically move you to the review screen.
         """
     )
     if config is None:
@@ -828,7 +1036,7 @@ def render_jira_workspace(
     reviewer_col, refresh_col = st.columns([3, 1])
     with reviewer_col:
         reviewer_label = st.selectbox(
-            "Whose tickets do you want to open?",
+            "1. Choose your name",
             options=JIRA_REVIEWER_NAMES,
             index=None,
             placeholder="Choose Karin, Steve, Janelle, Mike, or Mikayla",
@@ -838,14 +1046,16 @@ def render_jira_workspace(
         st.write("")
         refresh_clicked = st.button(
             "Refresh tickets",
-            type="primary",
             width="stretch",
             disabled=reviewer_label is None,
             key="jira-refresh-directory",
         )
 
     if reviewer_label is None:
-        st.info("Choose a reviewer to load their assigned Jira tickets.")
+        render_next_action(
+            "Your next step",
+            "Choose your name above to load your assigned Jira tickets.",
+        )
         return
 
     try:
@@ -919,7 +1129,7 @@ def render_jira_workspace(
 
     issues_by_key = {issue["key"]: issue for issue in issues}
     issue_key = st.selectbox(
-        "Assigned ticket",
+        "2. Choose an assigned ticket",
         options=list(issues_by_key),
         format_func=lambda key: (
             f"{key} · {issues_by_key[key]['summary']} "
@@ -963,123 +1173,8 @@ def render_jira_workspace(
     if issue["updated"]:
         st.caption(f"Last updated in Jira: {issue['updated']}")
 
-    st.markdown("#### Ticket actions")
-    action_status_col, action_assignee_col = st.columns(2)
-    with action_status_col:
-        try:
-            transitions = client.get_transitions(issue["key"])
-        except JiraIntegrationError as error:
-            transitions = []
-            st.error(str(error))
-        transitions_by_id = {
-            str(item.get("id") or ""): item
-            for item in transitions
-            if item.get("id")
-        }
-        transition_id = st.selectbox(
-            "Change status",
-            options=list(transitions_by_id),
-            index=None,
-            placeholder=(
-                "Choose an available Jira status"
-                if transitions_by_id
-                else "No status changes are available"
-            ),
-            format_func=lambda item_id: (
-                str(transitions_by_id[item_id].get("name") or "Move")
-                + " → "
-                + str(
-                    (transitions_by_id[item_id].get("to") or {}).get("name")
-                    or "Unknown"
-                )
-            ),
-            disabled=not transitions_by_id,
-            key=f"jira-transition-{issue['key']}",
-        )
-        if st.button(
-            "Update status",
-            type="primary",
-            width="stretch",
-            disabled=transition_id is None,
-            key=f"jira-update-status-{issue['key']}",
-        ):
-            try:
-                new_status = client.transition_issue_by_id(
-                    issue["key"],
-                    transition_id,
-                )
-                store_refreshed_jira_issue(client.get_issue(issue["key"]))
-                st.session_state.jira_action_flash = (
-                    f"Moved {issue['key']} to {new_status}."
-                )
-                st.rerun()
-            except JiraIntegrationError as error:
-                st.error(str(error))
-
-    with action_assignee_col:
-        target_label = st.selectbox(
-            "Reassign to",
-            options=JIRA_REVIEWER_NAMES,
-            index=None,
-            placeholder="Choose Karin, Steve, Janelle, Mike, or Mikayla",
-            key=f"jira-target-label-{issue['key']}",
-        )
-        target_person = None
-        if target_label:
-            try:
-                target_people = jira_reviewer_candidates(client, target_label)
-                target_issue_directory = (
-                    jira_candidate_issue_directory(
-                        client,
-                        target_label,
-                        target_people,
-                    )
-                    if len(target_people) > 1
-                    else {}
-                )
-                targets_with_issues = [
-                    person
-                    for person in target_people
-                    if target_issue_directory.get(person["account_id"])
-                ]
-                if len(targets_with_issues) == 1:
-                    target_person = targets_with_issues[0]
-                    st.caption(
-                        f"Jira account: {target_person['display_name']}"
-                    )
-                else:
-                    target_person = render_jira_person_choice(
-                        target_label,
-                        target_people,
-                        key=(
-                            f"jira-target-account-{issue['key']}-"
-                            f"{target_label.casefold()}"
-                        ),
-                    )
-            except JiraIntegrationError as error:
-                st.error(str(error))
-        already_assigned = bool(
-            target_person
-            and target_person["account_id"] == issue["assignee_account_id"]
-        )
-        if already_assigned:
-            st.caption(f"{issue['key']} is already assigned to this person.")
-        if st.button(
-            "Reassign ticket",
-            width="stretch",
-            disabled=target_person is None or already_assigned,
-            key=f"jira-reassign-{issue['key']}",
-        ):
-            try:
-                client.assign_issue(issue["key"], target_person["account_id"])
-                store_refreshed_jira_issue(client.get_issue(issue["key"]))
-                st.session_state.jira_action_flash = (
-                    f"Reassigned {issue['key']} to "
-                    f"{target_person['display_name']}."
-                )
-                st.rerun()
-            except JiraIntegrationError as error:
-                st.error(str(error))
+    with st.expander("Optional: update Jira status or assignee"):
+        render_jira_ticket_actions(client, issue)
 
     if issue["description"]:
         with st.expander("Ticket description"):
@@ -1090,18 +1185,18 @@ def render_jira_workspace(
         for attachment in issue["attachments"]
         if is_html_attachment(attachment)
     ]
-    st.markdown("#### HTML reports")
+    st.markdown("#### 3. Load the report")
     if not html_attachments:
         st.info(
-            "This ticket has no HTML attachment. Open any ticket links below "
-            "to download the report, then use the normal HTML uploader."
+            "This ticket has no HTML attachment. Open the ticket links below, "
+            "download the report, then use **Upload HTML manually** in the sidebar."
         )
     else:
         attachments_by_id = {
             attachment["id"]: attachment for attachment in html_attachments
         }
         attachment_id = st.selectbox(
-            "Issue Annotation Report attachment",
+            "Issue Annotation Report",
             options=list(attachments_by_id),
             format_func=lambda item_id: (
                 f"{attachments_by_id[item_id]['filename']} "
@@ -1111,8 +1206,9 @@ def render_jira_workspace(
         )
         attachment = attachments_by_id[attachment_id]
         if st.button(
-            "Load HTML into QA review",
+            "Load report and start review",
             type="primary",
+            width="stretch",
             key="jira-load-html",
         ):
             try:
@@ -1257,8 +1353,7 @@ def render_jira_handoff(
                 qa_owner_label = qa_by_id[qa_account_id]["display_name"]
     else:
         st.caption(
-            "QA reassign target is controlled by the deployment's "
-            "`JIRA_QA_ACCOUNT_ID` setting."
+            "The app will reassign the ticket to the configured QA owner."
         )
 
     csv_payload = final_csv_bytes(merged_rows)
@@ -1284,8 +1379,9 @@ def render_jira_handoff(
         st.caption(disabled_reason)
 
     if st.button(
-        "Attach CSV, mark for QA, and reassign",
+        "Send final CSV to Jira and mark ready for QA",
         type="primary",
+        width="stretch",
         disabled=bool(disabled_reason),
         key=f"jira-handoff-{report['report_id']}-{issue['key']}",
     ):
@@ -1337,14 +1433,13 @@ if not st.session_state.get("automatic_learning_initialized"):
 jira_config, jira_config_error = jira_configuration()
 
 st.markdown('<div class="qa-kicker">Curriculum quality operations</div>', unsafe_allow_html=True)
-st.markdown('<div class="qa-title">Kiddom QA Review Studio</div>', unsafe_allow_html=True)
+st.markdown('<div class="qa-title">Kiddom QA Review</div>', unsafe_allow_html=True)
 st.markdown(
     """
     <div class="qa-subtitle">
-      Open an assigned Jira ticket or drop in Issue Annotation Report HTML
-      files, triage findings with the established curriculum-aware rules,
-      preserve parsed reports in a shared library, reuse matching decisions
-      across course variants, and send training-safe results to QA.
+      Start with your Jira ticket. The app loads the report, handles recognized
+      patterns automatically, and walks you through the few decisions that
+      still need a person.
     </div>
     """,
     unsafe_allow_html=True,
@@ -1352,149 +1447,159 @@ st.markdown(
 
 
 with st.sidebar:
+    st.markdown("### Your workspace")
     if current_user.is_authenticated:
         st.markdown(f"**{current_user.name}**")
         st.caption(current_user.email)
         if current_user.is_admin:
             st.caption("App administrator")
-        if st.button("Sign out", width="stretch"):
-            st.logout()
-        st.divider()
     else:
         st.caption("Local development mode · Google sign-in is not configured")
 
-    st.header("1 · Jira")
     if jira_config:
-        st.success("Jira Cloud is connected to this deployment.")
+        st.caption("✓ Jira is connected")
     else:
-        st.caption("Configure Jira to load assigned tickets and return completed CSVs.")
-    if st.button("Open Jira ticket workspace", width="stretch"):
+        st.warning("Jira is not configured.")
+    if st.button("Go to Jira tickets", type="primary", width="stretch"):
         st.session_state.requested_primary_workspace = "Jira tickets"
         st.rerun()
-
-    st.divider()
-    st.header("2 · Upload HTML")
-    uploads = st.file_uploader(
-        "Kiddom report HTML",
-        type=["html", "htm"],
-        accept_multiple_files=True,
-        key=f"report-uploads-{st.session_state.upload_generation}",
-        help="You can process multiple courses in the same session.",
-    )
-    process_clicked = st.button(
-        "Process uploaded reports",
-        type="primary",
-        width="stretch",
-        disabled=not uploads,
+    st.caption(
+        "Start with Jira whenever possible. Use manual upload only when the "
+        "ticket does not include the report."
     )
 
-    if process_clicked and uploads:
-        memory_reuse_total = {"reused": 0, "exact": 0, "near": 0}
-        library_total = {
-            "reports": 0,
-            "findings": 0,
-            "automatic_rules_learned": 0,
-        }
-        for upload in uploads:
-            payload = upload.getvalue()
-            with st.spinner(f"Reading {upload.name}…"):
-                try:
-                    result = add_report_payload(upload.name, payload)
-                except (QAEngineError, UnicodeError, ValueError) as error:
-                    st.error(f"{upload.name}: {error}")
-                    continue
-            if result["library_error"]:
-                st.warning(
-                    f"{upload.name} was processed but could not be saved "
-                    f"to the shared library: {result['library_error']}"
-                )
-            memory_result = result["memory"]
-            for result_key in memory_reuse_total:
-                memory_reuse_total[result_key] += memory_result[result_key]
-            library_total["reports"] += int(result["library_saved"])
-            library_total["findings"] += result["stored_findings"]
-            library_total["automatic_rules_learned"] += result[
-                "automatic_rules_learned"
-            ]
-            del payload
-        st.session_state.upload_generation += 1
-        st.session_state.processing_flash = {
-            **memory_reuse_total,
-            **library_total,
-        }
-        st.rerun()
+    with st.expander("Upload HTML manually"):
+        st.caption(
+            "Choose one or more Issue Annotation Report HTML files, then "
+            "select **Process reports**."
+        )
+        uploads = st.file_uploader(
+            "Report HTML",
+            type=["html", "htm"],
+            accept_multiple_files=True,
+            key=f"report-uploads-{st.session_state.upload_generation}",
+            help="You can process multiple courses in the same session.",
+        )
+        process_clicked = st.button(
+            "Process reports",
+            type="primary",
+            width="stretch",
+            disabled=not uploads,
+        )
 
-    st.divider()
-    st.header("3 · Shared library")
+        if process_clicked and uploads:
+            memory_reuse_total = {"reused": 0, "exact": 0, "near": 0}
+            library_total = {
+                "reports": 0,
+                "findings": 0,
+                "automatic_rules_learned": 0,
+            }
+            for upload in uploads:
+                payload = upload.getvalue()
+                with st.spinner(f"Reading {upload.name}…"):
+                    try:
+                        result = add_report_payload(upload.name, payload)
+                    except (QAEngineError, UnicodeError, ValueError) as error:
+                        st.error(f"{upload.name}: {error}")
+                        continue
+                if result["library_error"]:
+                    st.warning(
+                        f"{upload.name} was processed but could not be saved "
+                        f"to the shared library: {result['library_error']}"
+                    )
+                memory_result = result["memory"]
+                for result_key in memory_reuse_total:
+                    memory_reuse_total[result_key] += memory_result[result_key]
+                library_total["reports"] += int(result["library_saved"])
+                library_total["findings"] += result["stored_findings"]
+                library_total["automatic_rules_learned"] += result[
+                    "automatic_rules_learned"
+                ]
+                del payload
+            st.session_state.upload_generation += 1
+            st.session_state.processing_flash = {
+                **memory_reuse_total,
+                **library_total,
+            }
+            st.session_state.requested_primary_workspace = "Review workspace"
+            st.rerun()
+
     saved_reports = (
         list_report_library(MEMORY_PATH)
         if not st.session_state.memory_error
         else []
     )
-    saved_report_by_id = {
-        str(item["report_id"]): item for item in saved_reports
-    }
-    saved_report_id = st.selectbox(
-        "Open a saved report",
-        options=list(saved_report_by_id),
-        format_func=lambda report_id: (
-            f"{saved_report_by_id[report_id]['report_name']} "
-            f"({saved_report_by_id[report_id]['finding_count']:,} findings)"
-        ),
-        disabled=not saved_reports,
-        placeholder="No saved reports yet",
-    )
-    if st.button(
-        "Open saved report",
-        width="stretch",
-        disabled=not saved_report_id,
-    ):
-        open_saved_report(str(saved_report_id))
-        st.rerun()
-    if saved_reports:
+    with st.expander(f"Resume a saved report ({len(saved_reports)})"):
+        saved_report_by_id = {
+            str(item["report_id"]): item for item in saved_reports
+        }
+        saved_report_id = st.selectbox(
+            "Saved report",
+            options=list(saved_report_by_id),
+            format_func=lambda report_id: (
+                f"{saved_report_by_id[report_id]['report_name']} "
+                f"({saved_report_by_id[report_id]['finding_count']:,} findings)"
+            ),
+            disabled=not saved_reports,
+            placeholder="No saved reports yet",
+        )
+        if st.button(
+            "Open report",
+            width="stretch",
+            disabled=not saved_report_id,
+        ):
+            open_saved_report(str(saved_report_id))
+            st.session_state.requested_primary_workspace = "Review workspace"
+            st.rerun()
         st.caption(
-            f"{len(saved_reports):,} parsed reports are available to every user."
+            "Saved reports keep parsed findings and draft decisions; the "
+            "original HTML is not retained."
         )
 
-    st.divider()
-    st.header("4 · Rulebook")
-    st.caption(f"Active version: {st.session_state.rules['rules_version']}")
-    custom_rules = st.file_uploader(
-        "Load an updated rulebook",
-        type=["json"],
-        key="custom-rules-upload",
-    )
-    if st.button(
-        "Use uploaded rulebook",
-        width="stretch",
-        disabled=custom_rules is None,
-    ):
-        try:
-            st.session_state.rules = load_rules(custom_rules.getvalue())
-            learning_result = refresh_automatic_learning()
-            st.success(
-                "Rulebook loaded, safe shared patterns reapplied, and reports "
-                f"reclassified ({len(learning_result['active']):,} automatic rules)."
+    if current_user.is_admin:
+        with st.expander("Admin settings"):
+            st.caption(
+                f"Rulebook version: {st.session_state.rules['rules_version']}"
             )
-            st.rerun()
-        except (QAEngineError, ValueError) as error:
-            st.error(str(error))
-    if st.button("Reset to bundled rules", width="stretch"):
-        st.session_state.rules = load_rules(BASE_RULES_PATH)
-        learning_result = refresh_automatic_learning()
-        st.success(
-            "Bundled rules restored and safe shared patterns reapplied "
-            f"({len(learning_result['active']):,} automatic rules)."
-        )
-        st.rerun()
+            custom_rules = st.file_uploader(
+                "Load a rulebook JSON",
+                type=["json"],
+                key="custom-rules-upload",
+            )
+            if st.button(
+                "Use uploaded rulebook",
+                width="stretch",
+                disabled=custom_rules is None,
+            ):
+                try:
+                    st.session_state.rules = load_rules(custom_rules.getvalue())
+                    learning_result = refresh_automatic_learning()
+                    st.success(
+                        "Rulebook loaded and reports reclassified "
+                        f"({len(learning_result['active']):,} automatic rules)."
+                    )
+                    st.rerun()
+                except (QAEngineError, ValueError) as error:
+                    st.error(str(error))
+            if st.button("Reset to bundled rules", width="stretch"):
+                st.session_state.rules = load_rules(BASE_RULES_PATH)
+                learning_result = refresh_automatic_learning()
+                st.success(
+                    "Bundled rules restored "
+                    f"({len(learning_result['active']):,} automatic rules)."
+                )
+                st.rerun()
 
     st.divider()
     st.caption(
-        "Raw HTML is discarded after parsing. Compact report snapshots, saved "
-        "review drafts, and published decisions are shared by this deployment."
+        "Reports and draft decisions are shared across this deployment. "
+        "Original HTML files are discarded after parsing."
     )
     if st.session_state.memory_error:
-        st.error(f"Decision memory unavailable: {st.session_state.memory_error}")
+        st.error(f"Shared memory unavailable: {st.session_state.memory_error}")
+    if current_user.is_authenticated:
+        if st.button("Sign out", width="stretch"):
+            st.logout()
 
 processing_flash = st.session_state.pop("processing_flash", None)
 if processing_flash is not None:
@@ -1541,37 +1646,41 @@ if st.session_state.get("workspace_flow_version") != "jira-first-v1":
 if requested_workspace:
     st.session_state.primary_workspace = requested_workspace
 primary_workspace = st.radio(
-    "Primary workspace",
+    "Where do you want to work?",
     ["Jira tickets", "Review workspace"],
     horizontal=True,
-    label_visibility="collapsed",
+    format_func=lambda value: (
+        "1 · Get a report from Jira"
+        if value == "Jira tickets"
+        else "2–3 · Review and finish"
+    ),
     key="primary_workspace",
 )
 if primary_workspace == "Jira tickets":
+    render_workflow_steps(1)
     render_jira_workspace(jira_config, jira_config_error, current_user)
     st.stop()
 
 
 if not st.session_state.reports:
+    render_workflow_steps(1)
+    render_next_action(
+        "Start with a report",
+        "Choose <strong>1 · Get a report from Jira</strong> above, or use "
+        "<strong>Upload HTML manually</strong> in the sidebar.",
+    )
     st.markdown(
         """
         <div class="qa-callout">
-          Start in the sidebar. The app accepts the same generated HTML reports
-          used by the Codex skill, saves a compact parsed snapshot to the shared
-          library, and preserves the exact three-column, fully-quoted Kiddom
-          import format.
+          Nothing has been loaded in this session yet. If someone already
+          started this course, open it from <strong>Resume a saved
+          report</strong> in the sidebar.
         </div>
         """,
         unsafe_allow_html=True,
     )
-    left, middle, right = st.columns(3)
-    left.markdown("#### Parse\nDeduplicates every atomic checker finding.")
-    middle.markdown("#### Review\nFocuses humans only on ambiguous decisions.")
-    right.markdown(
-        "#### Reuse\nCarries confirmed decisions into matching course variants."
-    )
     if saved_reports:
-        st.markdown("#### Shared report library")
+        st.markdown("#### Reports available to resume")
         empty_library_frame = pd.DataFrame(
             [
                 {
@@ -1585,7 +1694,7 @@ if not st.session_state.reports:
             ]
         )
         st.dataframe(empty_library_frame, width="stretch", hide_index=True)
-        st.caption("Open any saved report from the sidebar to continue reviewing it.")
+        st.caption("Open one from **Resume a saved report** in the sidebar.")
     st.stop()
 
 
@@ -1608,45 +1717,57 @@ if report.get("jira_issue"):
         f"{source_issue['summary']}]({source_issue['browse_url']})"
     )
 merged_rows = apply_reviews(report["rows"], report["reviews"])
-counts = status_counts(merged_rows)
 completed, flagged_total = review_progress(report["rows"], report["reviews"])
 outstanding = flagged_total - completed
+render_workflow_steps(2 if outstanding else 3)
+if outstanding:
+    render_next_action(
+        "Next: review the flagged items",
+        f"Open <strong>2 · Review {outstanding:,} items</strong> below, choose "
+        "a decision for each row, and save.",
+    )
+else:
+    render_next_action(
+        "Review complete",
+        "Open <strong>3 · Finish and send</strong> below to save the learning, "
+        "download the final CSV, and return it to Jira.",
+    )
 
 automatically_handled = sum(
     row.get("status") in {"approved", "rejected"} for row in report["rows"]
 )
-metric_cols = st.columns(7)
+metric_cols = st.columns(4)
 metric_cols[0].metric("Findings", f"{len(report['rows']):,}")
-metric_cols[1].metric("Approved", f"{counts.get('approved', 0):,}")
-metric_cols[2].metric("Rejected", f"{counts.get('rejected', 0):,}")
-metric_cols[3].metric("Needs change", f"{counts.get('needs_change', 0):,}")
-metric_cols[4].metric(
-    "Automatically handled",
-    f"{automatically_handled:,}",
-)
-metric_cols[5].metric(
-    "Reused decisions",
-    f"{sum(bool(review.get('memory_match')) for review in report['reviews'].values()):,}",
-)
-metric_cols[6].metric("Review remaining", f"{outstanding:,}")
+metric_cols[1].metric("Handled automatically", f"{automatically_handled:,}")
+metric_cols[2].metric("Sent to review", f"{flagged_total:,}")
+metric_cols[3].metric("Still remaining", f"{outstanding:,}")
 
-page = st.radio(
-    "Workspace",
-    [
-        "Review report",
-        "Report Library",
-        "Decision Memory",
-        "Pattern Lab",
-        "Rulebook",
-    ],
+workspace_view = st.radio(
+    "Choose a view",
+    ["Review workflow", "Tools and history"],
     horizontal=True,
-    label_visibility="collapsed",
 )
+if workspace_view == "Review workflow":
+    page = "Review report"
+else:
+    page = st.selectbox(
+        "Open a tool",
+        [
+            "Report Library",
+            "Decision Memory",
+            "Pattern Lab",
+            "Rulebook",
+        ],
+    )
 
 
 if page == "Review report":
-    overview_tab, review_tab, export_tab, detail_tab = st.tabs(
-        ["Overview", "Human review", "Exports", "Detailed data"]
+    overview_tab, review_tab, export_tab = st.tabs(
+        [
+            "1 · Check progress",
+            f"2 · Review {outstanding:,} items",
+            "3 · Finish and send",
+        ]
     )
 
     with overview_tab:
@@ -1764,6 +1885,39 @@ if page == "Review report":
             st.caption(f"{completed:,} of {flagged_total:,} flagged decisions saved.")
 
     with review_tab:
+        st.markdown("#### What each decision means")
+        guide_cols = st.columns(3)
+        guide_cols[0].markdown(
+            """
+            <div class="qa-decision-guide">
+              <strong>Approved</strong>
+              The proposed correction is right. Apply it.
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        guide_cols[1].markdown(
+            """
+            <div class="qa-decision-guide">
+              <strong>Rejected</strong>
+              The original is right. Ignore the proposed correction.
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        guide_cols[2].markdown(
+            """
+            <div class="qa-decision-guide">
+              <strong>Needs change</strong>
+              Neither version is ready. Add the exact correction needed.
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        st.caption(
+            "For each row: compare Original and Proposed, choose one decision, "
+            "and add a short note only when it teaches the QA tool something reusable."
+        )
         full_frame = make_review_frame(report)
         if full_frame.empty:
             st.success("This report has no findings requiring human review.")
@@ -1793,9 +1947,7 @@ if page == "Review report":
 
             st.caption(
                 f"Showing {len(visible):,} of {len(full_frame):,} flagged findings. "
-                "Use a note when choosing needs_change. Write only a concrete "
-                "correction or reusable QA signal; workflow comments are omitted "
-                "from the final CSV."
+                "Complete the visible decisions, then select **Save these decisions**."
             )
             edited = st.data_editor(
                 visible,
@@ -1848,7 +2000,11 @@ if page == "Review report":
                 },
                 key=f"review-editor-{selected_key}",
             )
-            if st.button("Save visible decisions", type="primary"):
+            if st.button(
+                "Save these decisions",
+                type="primary",
+                width="stretch",
+            ):
                 draft_updates = {}
                 changed_events = []
                 for row in edited.to_dict("records"):
@@ -1958,6 +2114,14 @@ if page == "Review report":
                         st.error(str(error))
 
     with export_tab:
+        st.markdown("#### Finish in this order")
+        st.markdown(
+            """
+            1. Save the completed decisions so future courses can reuse them.
+            2. Download the final Kiddom CSV.
+            3. If this report came from Jira, send the CSV back to its ticket.
+            """
+        )
         merged_rows = apply_reviews(report["rows"], report["reviews"])
         completed, flagged_total = review_progress(report["rows"], report["reviews"])
         outstanding = flagged_total - completed
@@ -1986,11 +2150,8 @@ if page == "Review report":
         ]
         suppressed_comments = raw_comment_count - len(kept_comment_rows)
         st.caption(
-            "Final-comment policy: "
-            f"{len(kept_comment_rows):,} concrete QA-training comments will be "
-            f"included; {suppressed_comments:,} confidence, workflow, ambiguity, "
-            "or human-review comments will be blanked. Detailed data keeps the "
-            "internal reviewer guidance."
+            f"The final CSV will keep {len(kept_comment_rows):,} reusable QA "
+            f"comments and remove {suppressed_comments:,} workflow or review notes."
         )
         if kept_comment_rows:
             with st.expander("Preview comments included in the final CSV"):
@@ -2010,7 +2171,7 @@ if page == "Review report":
 
         publish_col, publish_note_col = st.columns([1, 2])
         if publish_col.button(
-            "Publish review to shared memory",
+            "Save for future reports",
             type="primary",
             disabled=bool(outstanding or st.session_state.memory_error),
             width="stretch",
@@ -2059,7 +2220,7 @@ if page == "Review report":
             st.rerun()
         if outstanding:
             publish_note_col.caption(
-                "Complete every flagged decision before publishing to shared memory."
+                "Complete every flagged decision before saving this learning."
             )
         elif report.get("memory_published") is not None:
             publish_note_col.caption(
@@ -2068,8 +2229,8 @@ if page == "Review report":
             )
         else:
             publish_note_col.caption(
-                "Publishing stores compact contextual fingerprints and decisions, "
-                "not the original HTML file."
+                "This lets matching course variants reuse the decisions. "
+                "The original HTML is not stored."
             )
 
         publish_flash = st.session_state.pop("memory_publish_flash", None)
@@ -2091,35 +2252,37 @@ if page == "Review report":
             st.success(message)
 
         st.divider()
-        download_cols = st.columns(2)
-        download_cols[0].download_button(
+        st.download_button(
             "Download final Kiddom CSV",
             final_csv_bytes(merged_rows),
             file_name=f"{report['name']}_FINAL.csv",
             mime="text/csv",
+            type="primary",
             width="stretch",
         )
-        download_cols[1].download_button(
-            "Download review sheet",
-            review_csv_bytes(report["rows"], report["reviews"]),
-            file_name=f"{report['name']}_flagged_for_review.csv",
-            mime="text/csv",
-            width="stretch",
-        )
-        download_cols[0].download_button(
-            "Download detailed audit CSV",
-            detailed_csv_bytes(report["rows"]),
-            file_name=f"{report['name']}_detailed.csv",
-            mime="text/csv",
-            width="stretch",
-        )
-        download_cols[1].download_button(
-            "Download complete review package",
-            build_export_zip(report),
-            file_name=f"{report['name']}_review_package.zip",
-            mime="application/zip",
-            width="stretch",
-        )
+        with st.expander("Optional downloads"):
+            download_cols = st.columns(2)
+            download_cols[0].download_button(
+                "Review sheet",
+                review_csv_bytes(report["rows"], report["reviews"]),
+                file_name=f"{report['name']}_flagged_for_review.csv",
+                mime="text/csv",
+                width="stretch",
+            )
+            download_cols[1].download_button(
+                "Detailed audit CSV",
+                detailed_csv_bytes(report["rows"]),
+                file_name=f"{report['name']}_detailed.csv",
+                mime="text/csv",
+                width="stretch",
+            )
+            st.download_button(
+                "Complete review package",
+                build_export_zip(report),
+                file_name=f"{report['name']}_review_package.zip",
+                mime="application/zip",
+                width="stretch",
+            )
         render_jira_handoff(
             report,
             merged_rows,
@@ -2129,7 +2292,7 @@ if page == "Review report":
             current_user,
         )
 
-    with detail_tab:
+    with st.expander("Advanced: view all parsed findings"):
         detail_frame = pd.DataFrame(report["rows"])
         st.dataframe(
             detail_frame,
