@@ -157,7 +157,8 @@ character. Save the secrets, reboot the app, and open it in a private browser
 window to verify the Google sign-in screen and domain restriction.
 
 After sign-in, the Jira workspace presents the shared reviewer list: Karin,
-Steve, Janelle, and Mike. Selecting a name loads that person's open tickets.
+Steve, Janelle, Mike, and Mikayla. Selecting a name loads that person's open
+tickets.
 
 Local development remains available without `[auth]` and is labeled as local
 development mode. Do not share a production deployment until its Google auth
@@ -168,7 +169,7 @@ secrets are configured.
 Jira is optional. When configured, reviewers can:
 
 1. Open **Jira tickets** in the app.
-2. Choose Karin, Steve, Janelle, or Mike from the reviewer list.
+2. Choose Karin, Steve, Janelle, Mike, or Mikayla from the reviewer list.
 3. See open tickets assigned to that person, optionally limited to one project.
 4. Open ticket links, use Jira's available status transitions, reassign the
    ticket, or load an attached `.html` / `.htm` report

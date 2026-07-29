@@ -78,12 +78,13 @@ MEMORY_PATH = Path(
     or str(APP_DIR / "data" / "shared_memory.sqlite3")
 ).expanduser()
 DECISION_OPTIONS = ["", "approved", "rejected", "needs_change"]
-JIRA_REVIEWER_NAMES = ("Karin", "Steve", "Janelle", "Mike")
+JIRA_REVIEWER_NAMES = ("Karin", "Steve", "Janelle", "Mike", "Mikayla")
 JIRA_REVIEWER_SEARCH_QUERIES = {
     "karin": "Karin Hutchinson",
     "steve": "steve.masceri",
     "janelle": "Janelle Engle",
     "mike": "Mike Blasberg",
+    "mikayla": "Mikayla Mitchell",
 }
 
 
@@ -754,7 +755,7 @@ def render_jira_workspace(
             "Whose tickets do you want to open?",
             options=JIRA_REVIEWER_NAMES,
             index=None,
-            placeholder="Choose Karin, Steve, Janelle, or Mike",
+            placeholder="Choose Karin, Steve, Janelle, Mike, or Mikayla",
             key="jira-directory-reviewer",
         )
     with refresh_col:
@@ -944,7 +945,7 @@ def render_jira_workspace(
             "Reassign to",
             options=JIRA_REVIEWER_NAMES,
             index=None,
-            placeholder="Choose Karin, Steve, Janelle, or Mike",
+            placeholder="Choose Karin, Steve, Janelle, Mike, or Mikayla",
             key=f"jira-target-label-{issue['key']}",
         )
         target_person = None
