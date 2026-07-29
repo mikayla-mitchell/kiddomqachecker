@@ -37,7 +37,8 @@ CONCRETE_RE = re.compile(
         |standards?[-\s]code|markup\s+boundary
         |math\s+checker
         |math(?:ematical)?\s+(?:notation|expression|label|constant|variable)
-        |latex|mathml|equation|imaginary\s+unit
+        |latex|mathml|equation|imaginary\s+unit|math\s+shorthand
+        |repeated[-\s]letter|placeholder
         |citation\s+convention|doi|et\s+al
         |proper\s+noun|common\s+noun|idiom
         |missing[-\s]space|spacing\s+error

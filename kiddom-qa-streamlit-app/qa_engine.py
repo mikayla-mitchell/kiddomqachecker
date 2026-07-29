@@ -37,9 +37,24 @@ STANDARDS_CODE_RE = re.compile(
     r"[A-Z]{1,4}-[A-Z]{2,5}(\.[A-Za-z0-9]+)+|\b\d{1,2}\.[A-Z]{1,3}(\.[A-Za-z0-9]+)*\b"
 )
 STANDARDS_CODE_PREFIX_RE = re.compile(r"[A-Z]{2,4}-[A-Z]{2,5}$")
-MATH_MARKUP_RE = re.compile(r"<math[\s>]|math-repaired|MathML|\\\(|\\\[|xmlns")
 MATH_LABEL_RE = re.compile(r"\b(?:Equation|Card|Function|Expression)\s+[A-Z]\s*$")
 MATH_LABEL_AMBIGUOUS_RE = re.compile(r"\n\s*[A-Z]\s*$")
+MATH_VOCAB_AFTER_RE = re.compile(
+    r"^\s*(?:is|are|represents|denotes)\s+(?:a|the|an)?\s*"
+    r"(?:function|variable|constant|independent|dependent|coefficient|"
+    r"exponent|ratio|rate|slope)",
+    re.I,
+)
+REPEATED_LETTER_RE = re.compile(r"^(.)\1{2,}$", re.I)
+ABBREV_WORD_TAIL_RE = re.compile(
+    r"\b(?:mr|mrs|ms|dr|st|jr|sr|vs|etc|i\.e|e\.g|no|ave|blvd|approx|"
+    r"dept|est|fig|vol|pp|pg|op|assn|inc|corp|ltd|cf)\.\s*$",
+    re.I,
+)
+ABBREV_INITIALS_TAIL_RE = re.compile(r"(?:[A-Z]\.){2,4}\s*$")
+LIST_MARKER_TAIL_RE = re.compile(r"(?:\(?\d+\)|\(?[a-zA-Z]\)|\d+\.)\s*$")
+CONTAINER_TAG_RE = re.compile(r"</?(th|td|p|li|tr|table)\b")
+TABLE_CELL_TAG_RE = re.compile(r"<(/?)(td|th)\b")
 
 CAP_REJECT_KW = [
     "doi",
@@ -90,6 +105,100 @@ def _get_attr(block: str, attr: str) -> str | None:
     return match.group(1) if match else None
 
 
+def _strip_tags_with_map(html_text: str) -> tuple[str, list[int]]:
+    plain: list[str] = []
+    index_map: list[int] = []
+    index = 0
+    while index < len(html_text):
+        if html_text[index] == "<":
+            tag_end = html_text.find(">", index)
+            if tag_end == -1:
+                break
+            index = tag_end + 1
+            continue
+        plain.append(html_text[index])
+        index_map.append(index)
+        index += 1
+    return "".join(plain), index_map
+
+
+def _normalize_ws(text: str) -> tuple[str, list[int]]:
+    normalized: list[str] = []
+    index_map: list[int] = []
+    for index, character in enumerate(text):
+        if not character.isspace():
+            normalized.append(character)
+            index_map.append(index)
+    return "".join(normalized), index_map
+
+
+def _find_container_tag(
+    original_html: str,
+    plain: str,
+    plain_index_map: list[int],
+    anchor: str,
+) -> tuple[str | None, bool]:
+    """Locate a finding in original HTML and return its text container."""
+    if not anchor:
+        return None, False
+    normalized_plain, normalized_map = _normalize_ws(plain)
+    normalized_anchor, _ = _normalize_ws(anchor)
+    normalized_anchor = normalized_anchor.strip()
+    if not normalized_anchor:
+        return None, False
+
+    position = normalized_plain.find(normalized_anchor)
+    if position == -1:
+        for length in (60, 40, 25, 15, 8):
+            if len(normalized_anchor) > length:
+                position = normalized_plain.find(normalized_anchor[:length])
+                if position != -1:
+                    break
+    if position == -1 or position >= len(normalized_map):
+        return None, False
+
+    plain_position = normalized_map[position]
+    if plain_position >= len(plain_index_map):
+        return None, False
+    raw_position = plain_index_map[plain_position]
+    before = original_html[:raw_position]
+
+    open_td = 0
+    open_th = 0
+    combined = 0
+    last_open_end: int | None = None
+    for match in TABLE_CELL_TAG_RE.finditer(before):
+        closing = bool(match.group(1))
+        tag = match.group(2)
+        if tag == "td":
+            open_td += -1 if closing else 1
+        else:
+            open_th += -1 if closing else 1
+        if closing:
+            combined -= 1
+        else:
+            if combined <= 0:
+                tag_close = original_html.find(">", match.end())
+                last_open_end = tag_close + 1 if tag_close != -1 else match.end()
+            combined += 1
+
+    if open_td > 0 or open_th > 0:
+        cell_has_prior_text = False
+        if last_open_end is not None:
+            between = original_html[last_open_end:raw_position]
+            between_plain, _ = _strip_tags_with_map(between)
+            cell_has_prior_text = bool(between_plain.strip())
+        return ("td" if open_td > 0 else "th"), cell_has_prior_text
+
+    matches = list(CONTAINER_TAG_RE.finditer(before))
+    if not matches:
+        return None, False
+    last = matches[-1]
+    if before[last.start() : last.start() + 2] == "</":
+        return None, False
+    return last.group(1), False
+
+
 def parse_report_html(html_text: str) -> list[dict[str, Any]]:
     """Parse a Kiddom Issue Annotation Report into unique atomic findings."""
     card_splits = re.split(
@@ -122,6 +231,19 @@ def parse_report_html(html_text: str) -> list[dict[str, Any]]:
                 re.S,
             )
         )
+
+        original_tab_match = re.search(
+            r'data-tab="original">(.*?)</div>\s*</div>', card, re.S
+        )
+        original_html = (
+            ihtml.unescape(ihtml.unescape(original_tab_match.group(1)))
+            if original_tab_match
+            else ""
+        )
+        if original_html:
+            container_plain, container_index_map = _strip_tags_with_map(original_html)
+        else:
+            container_plain, container_index_map = "", []
 
         issue_splits = re.split(r'(?=<div class="aggregated-issue")', card)
         issue_chunks = [
@@ -168,10 +290,35 @@ def parse_report_html(html_text: str) -> list[dict[str, Any]]:
             context_after = ""
             if index < len(diff_pairs):
                 diff = diff_pairs[index]
-                before_raw = text_diff_html[max(0, diff.start() - 150) : diff.start()]
-                after_raw = text_diff_html[diff.end() : diff.end() + 150]
-                context_before = ihtml.unescape(re.sub("<[^>]+>", "", before_raw))
-                context_after = ihtml.unescape(re.sub("<[^>]+>", "", after_raw))
+                raw_window = 600
+                before_raw = text_diff_html[
+                    max(0, diff.start() - raw_window) : diff.start()
+                ]
+                after_raw = text_diff_html[
+                    diff.end() : diff.end() + raw_window
+                ]
+                before_stripped = ihtml.unescape(
+                    re.sub("<[^>]+>", "", before_raw)
+                )
+                after_stripped = ihtml.unescape(
+                    re.sub("<[^>]+>", "", after_raw)
+                )
+                context_before = before_stripped[-150:]
+                context_after = after_stripped[:150]
+
+            container_tag = None
+            container_cell_has_prior_text = False
+            if original_html and original:
+                anchor = original + context_after[:60]
+                (
+                    container_tag,
+                    container_cell_has_prior_text,
+                ) = _find_container_tag(
+                    original_html,
+                    container_plain,
+                    container_index_map,
+                    anchor,
+                )
 
             records.append(
                 {
@@ -189,6 +336,8 @@ def parse_report_html(html_text: str) -> list[dict[str, Any]]:
                     "context": f"{context_before} <<DIFF>> {context_after}",
                     "context_before": context_before,
                     "context_after": context_after,
+                    "container_tag": container_tag,
+                    "container_cell_has_prior_text": container_cell_has_prior_text,
                 }
             )
 
@@ -285,13 +434,50 @@ def damerau_levenshtein(left: str, right: str) -> int:
 
 
 def _looks_like_standards_or_math(before: str, after: str) -> bool:
-    if MATH_MARKUP_RE.search(before):
+    # A dangling backslash means the diff split a LaTeX escape such as "\;"
+    # or "\,". A complete expression anywhere else in the lookback window
+    # does not make an adjacent prose-spacing fix a math false positive.
+    if before.endswith("\\"):
         return True
     if STANDARDS_CODE_RE.search(f"{before} {after[:30]}"):
         return True
     if before and STANDARDS_CODE_PREFIX_RE.search(before):
         return True
     return bool(before and MATH_LABEL_RE.search(before))
+
+
+def _is_bare_math_token(context_after: str) -> bool:
+    """Return whether a flagged letter is an isolated math/label token."""
+    direct_letters = re.match(r"[a-zA-Z]*", context_after or "")
+    if direct_letters and direct_letters.group(0):
+        return False
+    rest = (context_after or "").lstrip(" \t\xa0")
+    if not rest:
+        return True
+    next_word = re.match(r"[a-zA-Z]+", rest)
+    if next_word:
+        return len(next_word.group(0)) <= 1
+    return True
+
+
+def _is_math_vocab_subject(context_after: str) -> bool:
+    return bool(MATH_VOCAB_AFTER_RE.match(context_after or ""))
+
+
+def _classify_capitalization_boundary(context_before: str) -> str:
+    """Classify a real sentence boundary, abbreviation, or unclear split."""
+    if not context_before.strip():
+        return "boundary"
+    tail = context_before.rstrip()
+    if not tail:
+        return "boundary"
+    if ABBREV_WORD_TAIL_RE.search(tail) or ABBREV_INITIALS_TAIL_RE.search(tail):
+        return "abbreviation"
+    if LIST_MARKER_TAIL_RE.search(tail):
+        return "boundary"
+    if tail[-1] in ".!?":
+        return "boundary"
+    return "unclear"
 
 
 def _cap_is_flagged(reasoning: str) -> bool:
@@ -329,6 +515,19 @@ def _classify_spelling(
     original = str(record.get("original") or "").strip()
     original_lower = original.lower()
     proposed = str(record.get("proposed") or "").strip()
+    context_before = str(record.get("context_before") or "")
+
+    if context_before.endswith("\\"):
+        return (
+            "rejected",
+            "Bare LaTeX command name; keep the original math notation.",
+        )
+
+    if REPEATED_LETTER_RE.fullmatch(original_lower):
+        return (
+            "rejected",
+            "Repeated-letter placeholder or math shorthand, not a misspelling.",
+        )
 
     if confidence_is_informative:
         if record.get("confidence") == "high":
@@ -381,6 +580,70 @@ def classify_record(
     if checker == "check_spelling":
         return _classify_spelling(record, confidence_is_informative, rules)
     if checker == "check_capitalization":
+        if _is_bare_math_token(context_after):
+            return (
+                "rejected",
+                "Bare single-letter math or answer-label token; keep lowercase.",
+            )
+        if _is_math_vocab_subject(context_after):
+            return (
+                "rejected",
+                "Math variable or function name; keep lowercase.",
+            )
+
+        container_tag = record.get("container_tag")
+        if container_tag in {"th", "td"}:
+            if record.get("container_cell_has_prior_text"):
+                boundary = _classify_capitalization_boundary(context_before)
+                if boundary == "boundary":
+                    return (
+                        "approved",
+                        "Sentence start inside a prose table cell; capitalize.",
+                    )
+                if boundary == "abbreviation":
+                    return (
+                        "rejected",
+                        "Text follows an abbreviation inside a table cell; keep lowercase.",
+                    )
+                return (
+                    "needs_change",
+                    "Capitalization boundary inside a prose table cell needs context.",
+                )
+            return (
+                "rejected",
+                "First text in a curriculum table cell follows the lowercase-label convention.",
+            )
+        if container_tag in {"p", "li"}:
+            boundary = _classify_capitalization_boundary(context_before)
+            if boundary == "boundary":
+                return (
+                    "approved",
+                    "Sentence or list-item start; capitalize.",
+                )
+            if boundary == "abbreviation":
+                return (
+                    "rejected",
+                    "Text follows an abbreviation, not a sentence boundary; keep lowercase.",
+                )
+            return (
+                "needs_change",
+                "Capitalization inside paragraph/list text needs context.",
+            )
+        if (
+            "container_tag" in record
+            and container_tag is None
+            and record.get("field") == "body_value"
+        ):
+            if re.search(r"['\"‘“]\s*$", context_before):
+                return (
+                    "approved",
+                    "Start of quoted speech; capitalize.",
+                )
+            return (
+                "rejected",
+                "Flattened body-value table/list label; keep lowercase.",
+            )
+
         if reasoning_raw:
             if any(keyword in reasoning for keyword in CAP_REJECT_KW):
                 return (
@@ -415,20 +678,34 @@ def classify_record(
             "value is unreliable.",
         )
     if checker == "check_proper_nouns":
+        combined = f"{context_before} {original} {context_after}".lower()
+        if (
+            original.lower() == "texas"
+            and "essential knowledge and skills" in combined
+        ):
+            return (
+                "approved",
+                'Official title "Texas Essential Knowledge and Skills"; capitalize Texas.',
+            )
         return "rejected", "Common noun or idiom, not a proper noun."
     if checker == "check_links":
         return "approved", ""
     if checker == "check_punctuation":
         if original == ".." and proposed == ".":
+            if context_after.strip():
+                return (
+                    "rejected",
+                    "Sentence-frame trailing-off convention; do not collapse the ellipsis to one period.",
+                )
             return (
                 "needs_change",
-                'Sentence-frame blank: use an ellipsis ("..."), not one period.',
+                "End-of-field double period may be a typo or deliberate trailing-off.",
             )
         if original.startswith(".") and proposed.startswith(". ") and len(original) > 2:
             return "approved", ""
         return "needs_change", "Punctuation convention needs human judgment."
     if checker == "check_spacing":
-        if re.match(r"^\s[.,?);]$", original) and re.sub(
+        if re.match(r"^\s[.,?);:]$", original) and re.sub(
             r"^\s+", "", original
         ) == proposed:
             return "approved", ""
