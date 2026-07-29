@@ -764,7 +764,6 @@ def render_jira_workspace(
             st.session_state.jira_loaded_reviewer_id = reviewer["account_id"]
             st.session_state.jira_loaded_reviewer_label = reviewer_label
             if reviewer_changed:
-                st.session_state.pop("jira-issue", None)
                 st.session_state.pop("jira_selected_issue", None)
         except JiraIntegrationError as error:
             st.session_state.jira_issues = []
@@ -785,7 +784,7 @@ def render_jira_workspace(
             f"{key} · {issues_by_key[key]['summary']} "
             f"· {issues_by_key[key]['status']}"
         ),
-        key="jira-issue",
+        key=f"jira-issue-{reviewer['account_id']}",
     )
     issue = issues_by_key[issue_key]
     st.session_state.jira_selected_issue = issue
