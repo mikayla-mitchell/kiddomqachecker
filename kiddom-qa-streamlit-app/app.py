@@ -1280,7 +1280,17 @@ with st.sidebar:
     else:
         st.caption("Local development mode · Google sign-in is not configured")
 
-    st.header("1 · Add reports")
+    st.header("1 · Jira")
+    if jira_config:
+        st.success("Jira Cloud is connected to this deployment.")
+    else:
+        st.caption("Configure Jira to load assigned tickets and return completed CSVs.")
+    if st.button("Open Jira ticket workspace", width="stretch"):
+        st.session_state.requested_primary_workspace = "Jira tickets"
+        st.rerun()
+
+    st.divider()
+    st.header("2 · Upload HTML")
     uploads = st.file_uploader(
         "Kiddom report HTML",
         type=["html", "htm"],
@@ -1322,16 +1332,6 @@ with st.sidebar:
             **memory_reuse_total,
             **library_total,
         }
-        st.rerun()
-
-    st.divider()
-    st.header("2 · Jira")
-    if jira_config:
-        st.success("Jira Cloud is connected to this deployment.")
-    else:
-        st.caption("Configure Jira to load assigned tickets and return completed CSVs.")
-    if st.button("Open Jira ticket workspace", width="stretch"):
-        st.session_state.requested_primary_workspace = "Jira tickets"
         st.rerun()
 
     st.divider()
@@ -1431,11 +1431,14 @@ if jira_load_warning:
     )
 
 requested_workspace = st.session_state.pop("requested_primary_workspace", None)
+if st.session_state.get("workspace_flow_version") != "jira-first-v1":
+    st.session_state.primary_workspace = "Jira tickets"
+    st.session_state.workspace_flow_version = "jira-first-v1"
 if requested_workspace:
     st.session_state.primary_workspace = requested_workspace
 primary_workspace = st.radio(
     "Primary workspace",
-    ["Review workspace", "Jira tickets"],
+    ["Jira tickets", "Review workspace"],
     horizontal=True,
     label_visibility="collapsed",
     key="primary_workspace",
