@@ -12,11 +12,13 @@ browser, and download fully quoted Kiddom import CSVs.
 - Signed-in reviewer attribution kept in a separate shared audit history
 - An optional Jira Cloud workspace for finding reviewers and their assigned
   tickets
-- Direct, authenticated loading of HTML attachments from Jira tickets
-- One-click loading of Issue Annotation Report HTML files from GitHub Actions
-  run links in Jira tickets
-- A confirmed completion handoff that attaches the final CSV, moves the ticket
-  to the configured QA status, and reassigns it to the QA owner
+- Automatic, authenticated loading of HTML attachments from Jira tickets
+- Automatic loading of Issue Annotation Report HTML files from GitHub Actions
+  run links, followed by a source-HTML attachment and comment on the Jira ticket
+- A one-click completion handoff that saves reusable decisions, attaches and
+  comments the all-findings CSV, reassigns to Ayo, and moves the ticket to the
+  configured QA status
+- A focused Jira view that hides unrelated assigned tickets by default
 - The same math, spelling, capitalization, spacing, punctuation, proper-noun,
   and broken-link rules used by the Codex skill
 - An editable human-review queue with source context and Kiddom node links
@@ -40,15 +42,16 @@ browser, and download fully quoted Kiddom import CSVs.
 
 1. Open **1 · Get a report from Jira**.
 2. Choose your name and assigned ticket.
-3. Select **Load report and start review** for a Jira attachment, or **Load
-   report directly from GitHub** for a linked workflow run.
-4. In **2 · Review items**, compare the original and proposed text:
+3. The app retrieves the report, attaches/comments the source HTML in Jira,
+   parses it, and opens the human-review queue automatically.
+4. Compare the original and proposed text:
    - **Approved** means the proposed correction is right.
    - **Rejected** means the original is right.
    - **Needs change** means neither version is ready; add the exact correction.
 5. Select **Save these decisions**.
-6. In **3 · Finish and send**, save the learning, download the final CSV, and
-   return it to Jira.
+6. In **3 · Finish and send**, select **Complete review and send to Ayo**.
+   The app handles shared learning, the complete CSV, Jira comment, reassignment,
+   Ready for QA transition, and the next ticket.
 
 Use **Upload HTML manually** only when the Jira ticket does not contain the
 report. Advanced report history, decision memory, pattern learning, and
@@ -201,13 +204,15 @@ Jira is optional. When configured, reviewers can:
 
 1. Open **Jira tickets** in the app.
 2. Choose Karin, Steve, Janelle, Mike, or Mikayla from the reviewer list.
-3. See open tickets assigned to that person, optionally limited to one project.
-4. Use Jira's available status transitions, reassign the ticket, or load a
-   report directly from a Jira attachment or linked GitHub Actions run.
+3. See QA report tickets assigned to that person; unrelated tickets are hidden
+   unless the reviewer turns on **Show other assigned Jira tickets**.
+4. Let the app load a report from a Jira attachment or linked GitHub Actions
+   run. GitHub-sourced HTML is attached to and noted on the ticket.
 5. Complete every human-review decision.
-6. In **Exports**, explicitly confirm the Jira handoff.
-7. Let the app attach the training-safe final CSV, transition the ticket to the
-   configured QA status, and reassign it to the configured QA owner.
+6. In **Finish and send**, run the single Jira handoff.
+7. The app publishes reusable human decisions, attaches and comments the
+   training-safe all-findings CSV, reassigns to Ayo, transitions to the
+   configured QA status, and offers the next QA ticket.
 
 The app never fetches arbitrary external ticket links on the server. Jira HTML
 attachments use Jira's authenticated attachment endpoint. A recognized
@@ -228,6 +233,7 @@ api_token = "..."
 project_key = "PMIM"
 ready_for_qa_status = "Ready for QA"
 qa_account_id = "..."
+qa_account_name = "Ayo"
 max_results = 50
 
 [jira_reviewers]
@@ -246,7 +252,7 @@ The equivalent environment variables are:
 - required: `JIRA_BASE_URL`, `JIRA_USER_EMAIL`, `JIRA_API_TOKEN`
 - recommended: `JIRA_PROJECT_KEY`, `JIRA_QA_ACCOUNT_ID`
 - optional: `JIRA_READY_FOR_QA_STATUS`, `JIRA_MAX_RESULTS`,
-  `JIRA_TICKET_JQL`
+  `JIRA_QA_ACCOUNT_NAME`, `JIRA_TICKET_JQL`
 
 For direct GitHub loading, create a fine-grained token limited to the
 repositories containing QA workflow runs. Grant only **Actions: Read-only**,
@@ -263,12 +269,13 @@ app and it opens immediately.
 `{project_key}` placeholders. Because it controls ticket visibility, only a
 deployment administrator should set it.
 
-The app uses a content hash in the attached CSV filename. If Jira accepts only
-part of a handoff, the reviewer can retry without creating a duplicate of the
-same CSV; already completed attachment, status, and assignee steps are skipped.
+The app uses content hashes and comment markers for retry safety. If Jira
+accepts only part of a handoff, the reviewer can retry without duplicating the
+source HTML, CSV, or comments; completed attachment, comment, assignee, and
+status steps are skipped.
 The Jira workflow still depends on the service account having permission to
-browse users and issues, add attachments, transition the chosen workflow, and
-assign the issue.
+browse users and issues, add attachments and comments, transition the chosen
+workflow, and assign the issue.
 
 Google sign-in identifies and authorizes the reviewer inside this app. Jira
 mutations still use the shared service account, so Jira's own change history

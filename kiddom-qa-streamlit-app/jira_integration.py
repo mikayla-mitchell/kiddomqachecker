@@ -39,6 +39,7 @@ class JiraConfig:
     project_key: str = ""
     ready_for_qa_status: str = "Ready for QA"
     qa_account_id: str = ""
+    qa_account_name: str = "Ayo"
     ticket_jql: str = ""
     max_results: int = 50
 
@@ -88,6 +89,9 @@ class JiraConfig:
                 str(values.get("JIRA_READY_FOR_QA_STATUS") or "Ready for QA").strip()
             ),
             qa_account_id=str(values.get("JIRA_QA_ACCOUNT_ID") or "").strip(),
+            qa_account_name=(
+                str(values.get("JIRA_QA_ACCOUNT_NAME") or "Ayo").strip()
+            ),
             ticket_jql=str(values.get("JIRA_TICKET_JQL") or "").strip(),
             max_results=max_results,
         )
@@ -196,6 +200,74 @@ def is_html_attachment(attachment: Mapping[str, Any]) -> bool:
         "text/html",
         "application/xhtml+xml",
     }
+
+
+def is_qa_report_issue(issue: Mapping[str, Any]) -> bool:
+    """Return whether a Jira issue appears to be part of QA report review."""
+    attachments = issue.get("attachments")
+    if isinstance(attachments, list) and any(
+        is_html_attachment(item)
+        for item in attachments
+        if isinstance(item, Mapping)
+    ):
+        return True
+    links = issue.get("links")
+    if isinstance(links, list) and any(
+        re.search(
+            r"^https://(?:www\.)?github\.com/[^/]+/[^/]+/actions/runs/\d+",
+            str(link).strip(),
+            re.I,
+        )
+        for link in links
+    ):
+        return True
+    searchable = " ".join(
+        (
+            str(issue.get("summary") or ""),
+            str(issue.get("description") or ""),
+        )
+    ).casefold()
+    return (
+        "issue annotation report" in searchable
+        or ("qa" in searchable and "report" in searchable)
+    )
+
+
+def _adf_document(text: str) -> dict[str, Any]:
+    """Build a Jira Cloud ADF document with clickable HTTP links."""
+
+    def inline_nodes(line: str) -> list[dict[str, Any]]:
+        nodes: list[dict[str, Any]] = []
+        cursor = 0
+        for match in HTTP_LINK_RE.finditer(line):
+            if match.start() > cursor:
+                nodes.append(
+                    {"type": "text", "text": line[cursor : match.start()]}
+                )
+            url = match.group(0).rstrip(".,);]")
+            trailing = match.group(0)[len(url) :]
+            nodes.append(
+                {
+                    "type": "text",
+                    "text": url,
+                    "marks": [{"type": "link", "attrs": {"href": url}}],
+                }
+            )
+            if trailing:
+                nodes.append({"type": "text", "text": trailing})
+            cursor = match.end()
+        if cursor < len(line):
+            nodes.append({"type": "text", "text": line[cursor:]})
+        return nodes
+
+    paragraphs = []
+    for line in str(text or "").splitlines() or [""]:
+        paragraph: dict[str, Any] = {"type": "paragraph"}
+        content = inline_nodes(line)
+        if content:
+            paragraph["content"] = content
+        paragraphs.append(paragraph)
+    return {"type": "doc", "version": 1, "content": paragraphs}
 
 
 class JiraClient:
@@ -445,6 +517,115 @@ class JiraClient:
         data = response.json()
         return data if isinstance(data, list) else []
 
+    def list_comments(
+        self,
+        issue_key: str,
+        *,
+        max_results: int = 100,
+    ) -> list[dict[str, Any]]:
+        response = self._request(
+            "GET",
+            f"/rest/api/3/issue/{quote(issue_key, safe='-')}/comment",
+            params={
+                "maxResults": max(1, min(int(max_results), 100)),
+                "orderBy": "-created",
+            },
+        )
+        data = response.json()
+        raw_comments = data.get("comments") if isinstance(data, Mapping) else None
+        if not isinstance(raw_comments, list):
+            raise JiraIntegrationError(
+                "Jira returned an unexpected comment list."
+            )
+        comments = []
+        for raw in raw_comments:
+            if not isinstance(raw, Mapping):
+                continue
+            body_text, links = _adf_text_and_links(raw.get("body"))
+            comments.append(
+                {
+                    "id": str(raw.get("id") or ""),
+                    "body": body_text,
+                    "links": links,
+                }
+            )
+        return comments
+
+    def add_comment(self, issue_key: str, text: str) -> str:
+        response = self._request(
+            "POST",
+            f"/rest/api/3/issue/{quote(issue_key, safe='-')}/comment",
+            expected=(201,),
+            headers={"Content-Type": "application/json"},
+            json={"body": _adf_document(text)},
+        )
+        data = response.json()
+        return str(data.get("id") or "") if isinstance(data, Mapping) else ""
+
+    def ensure_file_comment(
+        self,
+        issue_key: str,
+        filename: str,
+        payload: bytes,
+        *,
+        mime_type: str,
+        comment_text: str,
+        comment_marker: str,
+        attachment_step: str,
+        comment_step: str,
+    ) -> list[dict[str, str]]:
+        """Attach a file and add one marker-backed comment, retry-safely."""
+        completed: list[dict[str, str]] = []
+        issue = self.get_issue(issue_key)
+        attachment = next(
+            (
+                item
+                for item in issue.get("attachments", [])
+                if str(item.get("filename") or "") == filename
+            ),
+            None,
+        )
+        if attachment:
+            completed.append(
+                {"step": attachment_step, "result": "Already attached"}
+            )
+        else:
+            added = self.add_attachment(
+                issue_key,
+                filename,
+                payload,
+                mime_type,
+            )
+            attachment = added[0] if added else None
+            completed.append({"step": attachment_step, "result": "Attached"})
+
+        comments = self.list_comments(issue_key)
+        if any(
+            comment_marker in str(comment.get("body") or "")
+            for comment in comments
+        ):
+            completed.append(
+                {"step": comment_step, "result": "Already commented"}
+            )
+        else:
+            attachment_url = ""
+            if isinstance(attachment, Mapping):
+                attachment_url = str(
+                    attachment.get("content_url")
+                    or attachment.get("content")
+                    or ""
+                ).strip()
+            lines = [
+                comment_text.strip(),
+                f"Attachment: {filename}",
+            ]
+            if attachment_url:
+                lines.append(attachment_url)
+            lines.append(comment_marker)
+            self.add_comment(issue_key, "\n".join(line for line in lines if line))
+            completed.append({"step": comment_step, "result": "Commented"})
+        return completed
+
     def get_transitions(self, issue_key: str) -> list[dict[str, Any]]:
         response = self._request(
             "GET",
@@ -543,8 +724,11 @@ class JiraClient:
         csv_payload: bytes,
         qa_account_id: str,
         target_status: str,
+        *,
+        comment_text: str = "",
+        comment_marker: str = "",
     ) -> list[dict[str, str]]:
-        """Attach, transition, and reassign with retry-safe checks."""
+        """Attach, comment, reassign, and transition with retry-safe checks."""
         completed: list[dict[str, str]] = []
         try:
             issue = self.get_issue(issue_key)
@@ -552,13 +736,61 @@ class JiraClient:
                 str(item.get("filename") or "")
                 for item in issue.get("attachments", [])
             }
+            attachment = next(
+                (
+                    item
+                    for item in issue.get("attachments", [])
+                    if str(item.get("filename") or "") == filename
+                ),
+                None,
+            )
             if filename in existing_names:
                 completed.append(
                     {"step": "CSV attachment", "result": "Already attached"}
                 )
             else:
-                self.add_attachment(issue_key, filename, csv_payload)
+                added = self.add_attachment(issue_key, filename, csv_payload)
+                attachment = added[0] if added else None
                 completed.append({"step": "CSV attachment", "result": "Attached"})
+
+            if comment_text and comment_marker:
+                comments = self.list_comments(issue_key)
+                if any(
+                    comment_marker in str(comment.get("body") or "")
+                    for comment in comments
+                ):
+                    completed.append(
+                        {"step": "Jira comment", "result": "Already commented"}
+                    )
+                else:
+                    attachment_url = (
+                        str(
+                            attachment.get("content_url")
+                            or attachment.get("content")
+                            or ""
+                        )
+                        if isinstance(attachment, Mapping)
+                        else ""
+                    )
+                    lines = [comment_text.strip(), f"Attachment: {filename}"]
+                    if attachment_url:
+                        lines.append(attachment_url)
+                    lines.append(comment_marker)
+                    self.add_comment(
+                        issue_key,
+                        "\n".join(line for line in lines if line),
+                    )
+                    completed.append(
+                        {"step": "Jira comment", "result": "Commented"}
+                    )
+
+            if str(issue.get("assignee_account_id") or "") == qa_account_id:
+                completed.append(
+                    {"step": "QA assignee", "result": "Already assigned"}
+                )
+            else:
+                self.assign_issue(issue_key, qa_account_id)
+                completed.append({"step": "QA assignee", "result": "Reassigned"})
 
             if str(issue.get("status") or "").casefold() == target_status.casefold():
                 completed.append(
@@ -569,14 +801,6 @@ class JiraClient:
                 completed.append(
                     {"step": "Jira status", "result": f"Moved to {new_status}"}
                 )
-
-            if str(issue.get("assignee_account_id") or "") == qa_account_id:
-                completed.append(
-                    {"step": "QA assignee", "result": "Already assigned"}
-                )
-            else:
-                self.assign_issue(issue_key, qa_account_id)
-                completed.append({"step": "QA assignee", "result": "Reassigned"})
         except JiraIntegrationError as error:
             raise JiraHandoffError(str(error), completed) from error
         return completed

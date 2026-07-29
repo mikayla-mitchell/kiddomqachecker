@@ -54,6 +54,7 @@ from jira_integration import (
     JiraHandoffError,
     JiraIntegrationError,
     is_html_attachment,
+    is_qa_report_issue,
 )
 from pattern_learning import (
     AUTOMATIC_RULE_SOURCE,
@@ -372,6 +373,12 @@ def initialize_state(user: UserIdentity) -> None:
         st.session_state.github_report_candidates = {}
     if "github_report_errors" not in st.session_state:
         st.session_state.github_report_errors = {}
+    if "jira_report_errors" not in st.session_state:
+        st.session_state.jira_report_errors = {}
+    if "jira_auto_qa_people" not in st.session_state:
+        st.session_state.jira_auto_qa_people = {}
+    if "jira_auto_loaded_sources" not in st.session_state:
+        st.session_state.jira_auto_loaded_sources = set()
     if st.session_state.get("active_reviewer_email") != user.email:
         st.session_state.jira_people = []
         st.session_state.jira_issues = []
@@ -382,6 +389,9 @@ def initialize_state(user: UserIdentity) -> None:
         st.session_state.pop("jira_selected_issue", None)
         st.session_state.github_report_candidates = {}
         st.session_state.github_report_errors = {}
+        st.session_state.jira_report_errors = {}
+        st.session_state.jira_auto_qa_people = {}
+        st.session_state.jira_auto_loaded_sources = set()
         st.session_state.active_reviewer_email = user.email
     if "memory_initialized" not in st.session_state:
         try:
@@ -817,6 +827,7 @@ JIRA_SETTING_NAMES = (
     "JIRA_PROJECT_KEY",
     "JIRA_READY_FOR_QA_STATUS",
     "JIRA_QA_ACCOUNT_ID",
+    "JIRA_QA_ACCOUNT_NAME",
     "JIRA_TICKET_JQL",
     "JIRA_MAX_RESULTS",
 )
@@ -862,6 +873,7 @@ def render_jira_setup(configuration_error: str) -> None:
         project_key = "CURR"
         ready_for_qa_status = "Ready for QA"
         qa_account_id = "..."
+        qa_account_name = "Ayo"
         ```
 
         The API token stays server-side. Protect the Streamlit deployment with
@@ -1097,7 +1109,50 @@ def render_jira_ticket_actions(client: JiraClient, issue: dict) -> None:
                 st.error(str(error))
 
 
+def sync_source_report_to_jira(
+    client: JiraClient,
+    issue: dict,
+    filename: str,
+    payload: bytes,
+    *,
+    user: UserIdentity,
+    source_url: str = "",
+    preserve_filename: bool = False,
+) -> tuple[str, list[dict[str, str]]]:
+    """Attach source HTML and add its retry-safe Jira audit comment."""
+    content_hash = hashlib.sha256(payload).hexdigest()[:10]
+    attachment_name = (
+        filename
+        if preserve_filename
+        else f"{safe_report_name(filename)}_SOURCE_{content_hash}.html"
+    )
+    comment_lines = [
+        "Kiddom QA source report captured automatically before review.",
+        f"Original report: {filename}",
+        f"Reviewer: {user.name}",
+    ]
+    if source_url:
+        comment_lines.append(f"GitHub workflow: {source_url}")
+    steps = client.ensure_file_comment(
+        issue["key"],
+        attachment_name,
+        payload,
+        mime_type="text/html",
+        comment_text="\n".join(comment_lines),
+        comment_marker=f"[KIDDOM-QA-SOURCE:{content_hash}]",
+        attachment_step="Source HTML",
+        comment_step="Source comment",
+    )
+    st.session_state.jira_source_flash = {
+        "issue_key": issue["key"],
+        "filename": attachment_name,
+        "steps": steps,
+    }
+    return attachment_name, steps
+
+
 def render_github_report_loader(
+    client: JiraClient,
     issue: dict,
     refs: list[GitHubRunRef],
     *,
@@ -1139,6 +1194,17 @@ def render_github_report_loader(
         f"{issue['key']}:{selected_ref.owner}:{selected_ref.repo}:"
         f"{selected_ref.run_id}"
     )
+    if candidate_key in st.session_state.jira_auto_loaded_sources:
+        st.info("This report is already loaded in the review workspace.")
+        if st.button(
+            "Continue the loaded review",
+            type="primary",
+            width="stretch",
+            key=f"github-continue-report-{candidate_key}",
+        ):
+            st.session_state.requested_primary_workspace = "Review workspace"
+            st.rerun()
+        return
     prior_error = st.session_state.github_report_errors.get(candidate_key)
     if prior_error:
         st.error(prior_error)
@@ -1173,6 +1239,20 @@ def render_github_report_loader(
                             "github_artifact_name": candidate["artifact_name"],
                         },
                     )
+                    try:
+                        attachment_name, source_steps = sync_source_report_to_jira(
+                            client,
+                            issue,
+                            candidate["filename"],
+                            candidate["payload"],
+                            user=user,
+                            source_url=selected_ref.web_url,
+                        )
+                        result["report"]["jira_source_filename"] = attachment_name
+                        result["report"]["jira_source_steps"] = source_steps
+                    except JiraIntegrationError as error:
+                        st.session_state.jira_source_warning = str(error)
+                    st.session_state.jira_auto_loaded_sources.add(candidate_key)
                     activate_loaded_report(result)
                     st.rerun()
                 st.session_state.github_report_candidates[candidate_key] = candidates
@@ -1214,6 +1294,20 @@ def render_github_report_loader(
                     "github_artifact_name": candidate["artifact_name"],
                 },
             )
+            try:
+                attachment_name, source_steps = sync_source_report_to_jira(
+                    client,
+                    issue,
+                    candidate["filename"],
+                    candidate["payload"],
+                    user=user,
+                    source_url=selected_ref.web_url,
+                )
+                result["report"]["jira_source_filename"] = attachment_name
+                result["report"]["jira_source_steps"] = source_steps
+            except JiraIntegrationError as error:
+                st.session_state.jira_source_warning = str(error)
+        st.session_state.jira_auto_loaded_sources.add(candidate_key)
         st.session_state.github_report_candidates.pop(candidate_key, None)
         activate_loaded_report(result)
         st.rerun()
@@ -1336,13 +1430,43 @@ def render_jira_workspace(
             st.error(str(error))
             return
 
-    issues = st.session_state.jira_issues
-    if not issues:
+    all_issues = st.session_state.jira_issues
+    if not all_issues:
         st.info(f"No open {config.project_key or 'Jira'} tickets are assigned to "
                 f"{reviewer['display_name']}.")
         return
 
+    qa_issues = [issue for issue in all_issues if is_qa_report_issue(issue)]
+    other_issue_count = len(all_issues) - len(qa_issues)
+    show_other_tickets = st.toggle(
+        "Show other assigned Jira tickets",
+        value=False,
+        key=f"jira-show-other-{reviewer['account_id']}",
+        help=(
+            "QA report tickets are shown by default. Turn this on only when "
+            "you need a different assigned ticket."
+        ),
+    )
+    issues = all_issues if show_other_tickets else qa_issues
+    if other_issue_count and not show_other_tickets:
+        st.caption(
+            f"Showing {len(qa_issues):,} QA report ticket"
+            f"{'s' if len(qa_issues) != 1 else ''}; "
+            f"{other_issue_count:,} unrelated assigned ticket"
+            f"{'s are' if other_issue_count != 1 else ' is'} hidden."
+        )
+    if not issues:
+        st.info(
+            "No assigned tickets currently contain a QA report link, HTML "
+            "attachment, or QA report description. Turn on **Show other "
+            "assigned Jira tickets** to see everything."
+        )
+        return
+
     issues_by_key = {issue["key"]: issue for issue in issues}
+    issue_widget_key = f"jira-issue-{reviewer['account_id']}"
+    if st.session_state.get(issue_widget_key) not in issues_by_key:
+        st.session_state.pop(issue_widget_key, None)
     issue_key = st.selectbox(
         "2. Choose an assigned ticket",
         options=list(issues_by_key),
@@ -1350,7 +1474,7 @@ def render_jira_workspace(
             f"{key} · {issues_by_key[key]['summary']} "
             f"· {issues_by_key[key]['status']}"
         ),
-        key=f"jira-issue-{reviewer['account_id']}",
+        key=issue_widget_key,
     )
     issue = issues_by_key[issue_key]
     st.session_state.jira_selected_issue = issue
@@ -1412,45 +1536,91 @@ def render_jira_workspace(
         attachments_by_id = {
             attachment["id"]: attachment for attachment in html_attachments
         }
-        attachment_id = st.selectbox(
-            "Issue Annotation Report",
-            options=list(attachments_by_id),
-            format_func=lambda item_id: (
-                f"{attachments_by_id[item_id]['filename']} "
-                f"({attachments_by_id[item_id]['size'] / (1024 * 1024):.1f} MB)"
-            ),
-            key="jira-html-attachment",
-        )
+        if len(attachments_by_id) == 1:
+            attachment_id = next(iter(attachments_by_id))
+            st.caption(attachments_by_id[attachment_id]["filename"])
+        else:
+            attachment_id = st.selectbox(
+                "Issue Annotation Report",
+                options=list(attachments_by_id),
+                index=None,
+                placeholder="Choose the course report",
+                format_func=lambda item_id: (
+                    f"{attachments_by_id[item_id]['filename']} "
+                    f"({attachments_by_id[item_id]['size'] / (1024 * 1024):.1f} MB)"
+                ),
+                key=f"jira-html-attachment-{issue['key']}",
+            )
+        if attachment_id is None:
+            st.caption(
+                "This ticket contains multiple HTML reports. Choose the course "
+                "report and it will open automatically."
+            )
+            return
         attachment = attachments_by_id[attachment_id]
-        if st.button(
-            "Load report and start review",
-            type="primary",
-            width="stretch",
-            key="jira-load-html",
-        ):
-            try:
-                with st.spinner(
-                    f"Downloading and parsing {attachment['filename']}…"
-                ):
-                    payload = client.download_attachment(attachment["id"])
-                    result = add_report_payload(
-                        attachment["filename"],
-                        payload,
-                        {
-                            "jira_issue": issue,
-                            "jira_attachment_id": attachment["id"],
-                        },
-                    )
-                del payload
-                activate_loaded_report(result)
+        source_key = f"jira:{issue['key']}:{attachment['id']}"
+        if source_key in st.session_state.jira_auto_loaded_sources:
+            st.info("This report is already loaded in the review workspace.")
+            if st.button(
+                "Continue the loaded review",
+                type="primary",
+                width="stretch",
+                key=f"jira-continue-report-{source_key}",
+            ):
+                st.session_state.requested_primary_workspace = "Review workspace"
                 st.rerun()
-            except (JiraIntegrationError, QAEngineError, UnicodeError, ValueError) as error:
-                st.error(str(error))
+        else:
+            prior_error = st.session_state.jira_report_errors.get(source_key)
+            if prior_error:
+                st.error(prior_error)
+                if st.button(
+                    "Try automatic loading again",
+                    width="stretch",
+                    key=f"jira-retry-report-{source_key}",
+                ):
+                    st.session_state.jira_report_errors.pop(source_key, None)
+                    st.rerun()
+            else:
+                try:
+                    with st.spinner(
+                        f"Retrieving {attachment['filename']} and preparing review…"
+                    ):
+                        payload = client.download_attachment(attachment["id"])
+                        result = add_report_payload(
+                            attachment["filename"],
+                            payload,
+                            {
+                                "jira_issue": issue,
+                                "jira_attachment_id": attachment["id"],
+                            },
+                        )
+                        try:
+                            _, source_steps = sync_source_report_to_jira(
+                                client,
+                                issue,
+                                attachment["filename"],
+                                payload,
+                                user=user,
+                                preserve_filename=True,
+                            )
+                            result["report"]["jira_source_steps"] = source_steps
+                        except JiraIntegrationError as error:
+                            st.session_state.jira_source_warning = str(error)
+                    st.session_state.jira_auto_loaded_sources.add(source_key)
+                    activate_loaded_report(result)
+                    st.rerun()
+                except (
+                    JiraIntegrationError,
+                    QAEngineError,
+                    UnicodeError,
+                    ValueError,
+                ) as error:
+                    st.session_state.jira_report_errors[source_key] = str(error)
+                    st.error(str(error))
 
-    if github_refs:
-        if html_attachments:
-            st.markdown("##### Or from the linked GitHub workflow")
+    if github_refs and not html_attachments:
         render_github_report_loader(
+            client,
             issue,
             github_refs,
             user=user,
@@ -1537,29 +1707,91 @@ def render_jira_handoff(
         return
 
     client = jira_client(config)
+    if report.get("jira_handoff_complete"):
+        steps = report.get("jira_handoff") or []
+        st.success(
+            f"{issue['key']} is assigned to {config.qa_account_name or 'Ayo'} "
+            f"and marked {config.ready_for_qa_status}."
+        )
+        if steps:
+            st.dataframe(
+                pd.DataFrame(steps),
+                hide_index=True,
+                width="stretch",
+            )
+        if report.get("jira_memory_warning"):
+            st.warning(
+                "Jira was completed, but shared decision memory could not be "
+                f"updated: {report['jira_memory_warning']}"
+            )
+        elif report.get("jira_memory_result"):
+            st.caption(
+                f"Saved {report['jira_memory_result']['published']:,} human "
+                "decisions for matching future reports."
+            )
+        remaining_qa_issues = [
+            item
+            for item in st.session_state.jira_issues
+            if item["key"] != issue["key"] and is_qa_report_issue(item)
+        ]
+        next_label = (
+            f"Open next QA ticket ({len(remaining_qa_issues)} remaining)"
+            if remaining_qa_issues
+            else "Return to Jira tickets"
+        )
+        if st.button(
+            next_label,
+            type="primary",
+            width="stretch",
+            key=f"jira-next-{report['report_id']}-{issue['key']}",
+        ):
+            st.session_state.jira_issues = [
+                item
+                for item in st.session_state.jira_issues
+                if item["key"] != issue["key"]
+            ]
+            reviewer_id = st.session_state.get("jira_loaded_reviewer_id")
+            if reviewer_id:
+                st.session_state.pop(f"jira-issue-{reviewer_id}", None)
+            st.session_state.pop("jira_selected_issue", None)
+            st.session_state.requested_primary_workspace = "Jira tickets"
+            st.rerun()
+        return
+
     qa_account_id = config.qa_account_id
-    qa_owner_label = "the configured QA owner"
+    qa_owner_label = config.qa_account_name or "Ayo"
     if not qa_account_id:
-        with st.expander("Choose the QA owner"):
-            with st.form(f"jira-qa-search-{report['report_id']}"):
-                qa_query = st.text_input(
-                    "QA owner name or email",
-                    key=f"jira-qa-query-{report['report_id']}",
+        qa_account_id = jira_reviewer_mapping().get(
+            qa_owner_label.casefold(),
+            "",
+        )
+    if not qa_account_id:
+        cache_key = qa_owner_label.casefold()
+        if cache_key not in st.session_state.jira_auto_qa_people:
+            try:
+                st.session_state.jira_auto_qa_people[cache_key] = (
+                    client.search_named_users(qa_owner_label)
                 )
-                qa_search = st.form_submit_button(
-                    "Search Jira people",
-                    disabled=not qa_query.strip(),
+            except JiraIntegrationError as error:
+                st.session_state.jira_auto_qa_people[cache_key] = []
+                st.warning(
+                    f"The app could not look up {qa_owner_label} automatically: "
+                    f"{error}"
                 )
-            if qa_search:
-                try:
-                    st.session_state.jira_qa_people = client.search_users(qa_query)
-                except JiraIntegrationError as error:
-                    st.error(str(error))
-            qa_people = st.session_state.jira_qa_people
-            if qa_people:
-                qa_by_id = {person["account_id"]: person for person in qa_people}
+        qa_people = st.session_state.jira_auto_qa_people[cache_key]
+        if len(qa_people) == 1:
+            qa_account_id = qa_people[0]["account_id"]
+            qa_owner_label = qa_people[0]["display_name"]
+        elif qa_people:
+            with st.expander(
+                f"One-time setup: choose the Jira account for {qa_owner_label}",
+                expanded=True,
+            ):
+                qa_by_id = {
+                    person["account_id"]: person for person in qa_people
+                }
                 qa_account_id = st.selectbox(
-                    "Reassign to",
+                    "Reassign completed tickets to",
                     options=list(qa_by_id),
                     format_func=lambda account_id: qa_by_id[account_id][
                         "display_name"
@@ -1567,20 +1799,30 @@ def render_jira_handoff(
                     key=f"jira-qa-owner-{report['report_id']}",
                 )
                 qa_owner_label = qa_by_id[qa_account_id]["display_name"]
-    else:
+        else:
+            st.warning(
+                f"No active Jira user matched {qa_owner_label}. Add Ayo's Jira "
+                "account ID as `[jira].qa_account_id` in Streamlit Secrets."
+            )
+    if qa_account_id:
         st.caption(
-            "The app will reassign the ticket to the configured QA owner."
+            f"The app will reassign the completed ticket to {qa_owner_label}."
         )
 
     csv_payload = final_csv_bytes(merged_rows)
     content_hash = hashlib.sha256(csv_payload).hexdigest()[:10]
     csv_filename = f"{report['name']}_FINAL_{content_hash}.csv"
-    confirmation = st.checkbox(
-        (
-            f"Attach {csv_filename}, move {issue['key']} to "
-            f"{config.ready_for_qa_status}, and reassign it to {qa_owner_label}."
-        ),
-        key=f"jira-confirm-{report['report_id']}-{issue['key']}",
+    counts = Counter(str(row.get("status") or "") for row in merged_rows)
+    st.markdown(
+        f"""
+        <div class="qa-callout">
+          One action will attach and comment the complete {len(merged_rows):,}-row
+          CSV, save the human decisions for future reports, reassign
+          <strong>{issue['key']}</strong> to <strong>{qa_owner_label}</strong>,
+          and mark it <strong>{config.ready_for_qa_status}</strong>.
+        </div>
+        """,
+        unsafe_allow_html=True,
     )
     disabled_reason = ""
     if outstanding:
@@ -1588,14 +1830,14 @@ def render_jira_handoff(
             f"Complete the remaining {outstanding:,} human decisions first."
         )
     elif not qa_account_id:
-        disabled_reason = "Choose a QA owner first."
-    elif not confirmation:
-        disabled_reason = "Confirm the three Jira updates first."
+        disabled_reason = (
+            f"Configure or choose {qa_owner_label}'s Jira account first."
+        )
     if disabled_reason:
         st.caption(disabled_reason)
 
     if st.button(
-        "Send final CSV to Jira and mark ready for QA",
+        f"Complete review and send to {qa_owner_label}",
         type="primary",
         width="stretch",
         disabled=bool(disabled_reason),
@@ -1603,14 +1845,57 @@ def render_jira_handoff(
     ):
         try:
             with st.spinner(f"Updating Jira ticket {issue['key']}…"):
+                memory_result = None
+                memory_warning = ""
+                if not st.session_state.memory_error:
+                    try:
+                        if report.get("library_saved"):
+                            save_draft_reviews(
+                                MEMORY_PATH,
+                                report["report_id"],
+                                report["reviews"],
+                            )
+                        memory_result = publish_report_reviews(
+                            MEMORY_PATH,
+                            report["report_id"],
+                            report["filename"],
+                            report["rows"],
+                            report["reviews"],
+                        )
+                        report["memory_published"] = memory_result["published"]
+                        refresh_automatic_learning()
+                    except (DecisionMemoryError, OSError) as error:
+                        memory_warning = str(error)
+
+                comment_text = "\n".join(
+                    [
+                        "Kiddom QA review completed.",
+                        (
+                            f"All {len(merged_rows):,} findings are included: "
+                            f"{counts.get('approved', 0):,} approved, "
+                            f"{counts.get('rejected', 0):,} rejected, and "
+                            f"{counts.get('needs_change', 0):,} needs change."
+                        ),
+                        (
+                            "The CSV includes automatic classifications and "
+                            "human-review decisions with training-safe comments."
+                        ),
+                        f"Reviewer: {user.name}",
+                    ]
+                )
                 steps = client.handoff_completed_review(
                     issue["key"],
                     csv_filename,
                     csv_payload,
                     qa_account_id,
                     config.ready_for_qa_status,
+                    comment_text=comment_text,
+                    comment_marker=f"[KIDDOM-QA-FINAL:{content_hash}]",
                 )
             report["jira_handoff"] = steps
+            report["jira_handoff_complete"] = True
+            report["jira_memory_result"] = memory_result
+            report["jira_memory_warning"] = memory_warning
             record_report_activity(
                 report,
                 "jira_handoff",
@@ -1620,13 +1905,14 @@ def render_jira_handoff(
                             "issue_key": issue["key"],
                             "csv_filename": csv_filename,
                             "steps": steps,
+                            "memory": memory_result or {},
+                            "memory_warning": memory_warning,
                         }
                     }
                 ],
                 user,
             )
-            st.success(f"Jira ticket {issue['key']} is ready for QA.")
-            st.dataframe(pd.DataFrame(steps), hide_index=True, width="stretch")
+            st.rerun()
         except JiraHandoffError as error:
             if error.completed_steps:
                 st.warning(
@@ -1853,6 +2139,20 @@ if jira_load_warning:
     st.warning(
         "The Jira HTML was processed, but its snapshot could not be saved to "
         f"the shared library: {jira_load_warning}"
+    )
+
+jira_source_flash = st.session_state.pop("jira_source_flash", None)
+if jira_source_flash:
+    st.toast(
+        f"Source HTML attached and noted on {jira_source_flash['issue_key']}.",
+        icon="📎",
+    )
+
+jira_source_warning = st.session_state.pop("jira_source_warning", None)
+if jira_source_warning:
+    st.warning(
+        "The report is ready to review, but Jira did not accept the automatic "
+        f"source attachment/comment: {jira_source_warning}"
     )
 
 requested_workspace = st.session_state.pop("requested_primary_workspace", None)
@@ -2330,12 +2630,12 @@ if page == "Review report":
                         st.error(str(error))
 
     with export_tab:
-        st.markdown("#### Finish in this order")
+        st.markdown("#### Finish the review")
         st.markdown(
             """
-            1. Save the completed decisions so future courses can reuse them.
-            2. Download the final Kiddom CSV.
-            3. If this report came from Jira, send the CSV back to its ticket.
+            Complete the remaining human decisions, then use the Jira handoff
+            below. The app will save the learning, attach and comment the
+            all-findings CSV, reassign to Ayo, and mark the ticket ready for QA.
             """
         )
         merged_rows = apply_reviews(report["rows"], report["reviews"])
@@ -2385,10 +2685,21 @@ if page == "Review report":
                     hide_index=True,
                 )
 
+        render_jira_handoff(
+            report,
+            merged_rows,
+            outstanding,
+            jira_config,
+            jira_config_error,
+            current_user,
+        )
+        if report.get("jira_handoff_complete"):
+            st.stop()
+
+        st.markdown("#### Optional: save or download without completing Jira")
         publish_col, publish_note_col = st.columns([1, 2])
         if publish_col.button(
             "Save for future reports",
-            type="primary",
             disabled=bool(outstanding or st.session_state.memory_error),
             width="stretch",
             help=(
@@ -2473,7 +2784,6 @@ if page == "Review report":
             final_csv_bytes(merged_rows),
             file_name=f"{report['name']}_FINAL.csv",
             mime="text/csv",
-            type="primary",
             width="stretch",
         )
         with st.expander("Optional downloads"):
@@ -2499,14 +2809,6 @@ if page == "Review report":
                 mime="application/zip",
                 width="stretch",
             )
-        render_jira_handoff(
-            report,
-            merged_rows,
-            outstanding,
-            jira_config,
-            jira_config_error,
-            current_user,
-        )
 
     with st.expander("Advanced: view all parsed findings"):
         detail_frame = pd.DataFrame(report["rows"])
