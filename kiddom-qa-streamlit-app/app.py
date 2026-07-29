@@ -370,6 +370,8 @@ def initialize_state(user: UserIdentity) -> None:
         st.session_state.jira_reviewer_issue_directory = {}
     if "github_report_candidates" not in st.session_state:
         st.session_state.github_report_candidates = {}
+    if "github_report_errors" not in st.session_state:
+        st.session_state.github_report_errors = {}
     if st.session_state.get("active_reviewer_email") != user.email:
         st.session_state.jira_people = []
         st.session_state.jira_issues = []
@@ -379,6 +381,7 @@ def initialize_state(user: UserIdentity) -> None:
         st.session_state.pop("jira_loaded_reviewer_label", None)
         st.session_state.pop("jira_selected_issue", None)
         st.session_state.github_report_candidates = {}
+        st.session_state.github_report_errors = {}
         st.session_state.active_reviewer_email = user.email
     if "memory_initialized" not in st.session_state:
         try:
@@ -771,24 +774,40 @@ def github_configuration() -> tuple[GitHubConfig | None, str]:
         return None, str(error)
 
 
-def render_github_setup(configuration_error: str) -> None:
-    st.info(configuration_error)
-    st.markdown(
-        """
-        Ask the app administrator to add one read-only GitHub credential in
-        **Streamlit → App settings → Secrets**:
-
-        ```toml
-        [github]
-        token = "github_pat_..."
-        ```
-
-        Use a fine-grained token for the repositories that contain the QA
-        workflow runs, with **Actions: Read-only** permission. If the Kiddom
-        GitHub organization uses SSO, authorize the token for the organization.
-        The token remains server-side and is never shown to reviewers.
-        """
+def render_github_setup(
+    configuration_error: str,
+    *,
+    show_admin_details: bool,
+) -> None:
+    st.warning(
+        "Automatic report loading needs a one-time GitHub connection from "
+        "an app administrator."
     )
+    if show_admin_details:
+        with st.expander("Administrator setup", expanded=True):
+            st.caption(configuration_error)
+            st.markdown(
+                """
+                Add one read-only GitHub credential in
+                **Streamlit → App settings → Secrets**:
+
+                ```toml
+                [github]
+                token = "github_pat_..."
+                ```
+
+                Use a fine-grained token for the repositories that contain the
+                QA workflow runs, with **Actions: Read-only** permission. If
+                the Kiddom GitHub organization uses SSO, authorize the token
+                for the organization. The token remains server-side and is
+                never shown to reviewers.
+                """
+            )
+    else:
+        st.caption(
+            "Please contact the app administrator. You can use manual upload "
+            "from the sidebar until the connection is added."
+        )
 
 
 JIRA_SETTING_NAMES = (
@@ -1082,111 +1101,125 @@ def render_github_report_loader(
     issue: dict,
     refs: list[GitHubRunRef],
     *,
-    primary: bool,
+    user: UserIdentity,
 ) -> None:
     st.success(
-        "GitHub workflow run found. The report can be loaded here without "
-        "opening GitHub or downloading a file manually."
+        "GitHub workflow run found. The app will retrieve and open the report "
+        "automatically."
     )
     if len(refs) == 1:
         selected_ref = refs[0]
         st.caption(selected_ref.label)
     else:
         selected_index = st.selectbox(
-            "GitHub workflow run",
+            "Choose the workflow run",
             options=range(len(refs)),
+            index=None,
+            placeholder="Select a run to continue automatically",
             format_func=lambda index: refs[index].label,
             key=f"github-run-{issue['key']}",
         )
+        if selected_index is None:
+            st.caption(
+                "This ticket contains more than one workflow run. Choose the "
+                "one for this course."
+            )
+            return
         selected_ref = refs[selected_index]
 
     config, configuration_error = github_configuration()
     if config is None:
-        render_github_setup(configuration_error)
+        render_github_setup(
+            configuration_error,
+            show_admin_details=user.is_admin,
+        )
         return
 
     candidate_key = (
         f"{issue['key']}:{selected_ref.owner}:{selected_ref.repo}:"
         f"{selected_ref.run_id}"
     )
-    candidates = st.session_state.github_report_candidates.get(candidate_key, [])
-    if not candidates:
+    prior_error = st.session_state.github_report_errors.get(candidate_key)
+    if prior_error:
+        st.error(prior_error)
         if st.button(
-            "Load report directly from GitHub",
-            type="primary" if primary else "secondary",
+            "Try automatic loading again",
             width="stretch",
-            key=f"github-find-report-{candidate_key}",
+            key=f"github-retry-report-{candidate_key}",
         ):
-            try:
-                with st.spinner(
-                    "Reading the workflow artifact and finding the report HTML…"
-                ):
-                    candidates = GitHubActionsClient(config).find_report_files(
-                        selected_ref
-                    )
-                    if len(candidates) == 1:
-                        candidate = candidates[0]
-                        result = add_report_payload(
-                            candidate["filename"],
-                            candidate["payload"],
-                            {
-                                "jira_issue": issue,
-                                "jira_attachment_id": "",
-                                "github_run_url": selected_ref.web_url,
-                                "github_artifact_id": candidate["artifact_id"],
-                                "github_artifact_name": candidate["artifact_name"],
-                            },
-                        )
-                        activate_loaded_report(result)
-                        st.rerun()
-                    st.session_state.github_report_candidates = {
-                        candidate_key: candidates
-                    }
-                    st.rerun()
-            except (
-                GitHubIntegrationError,
-                QAEngineError,
-                UnicodeError,
-                ValueError,
-            ) as error:
-                st.error(str(error))
+            st.session_state.github_report_errors.pop(candidate_key, None)
+            st.rerun()
         return
 
-    st.caption(
-        f"Found {len(candidates)} Issue Annotation Reports in "
-        f"{candidates[0]['artifact_name']}."
+    candidates = st.session_state.github_report_candidates.get(candidate_key, [])
+    if not candidates:
+        try:
+            with st.spinner(
+                "Retrieving the report from GitHub and preparing the review…"
+            ):
+                candidates = GitHubActionsClient(config).find_report_files(
+                    selected_ref
+                )
+                if len(candidates) == 1:
+                    candidate = candidates[0]
+                    result = add_report_payload(
+                        candidate["filename"],
+                        candidate["payload"],
+                        {
+                            "jira_issue": issue,
+                            "jira_attachment_id": "",
+                            "github_run_url": selected_ref.web_url,
+                            "github_artifact_id": candidate["artifact_id"],
+                            "github_artifact_name": candidate["artifact_name"],
+                        },
+                    )
+                    activate_loaded_report(result)
+                    st.rerun()
+                st.session_state.github_report_candidates[candidate_key] = candidates
+        except (
+            GitHubIntegrationError,
+            QAEngineError,
+            UnicodeError,
+            ValueError,
+        ) as error:
+            st.session_state.github_report_errors[candidate_key] = str(error)
+            st.error(str(error))
+            return
+
+    st.info(
+        f"This run contains {len(candidates)} course reports. Choose the one "
+        "for this ticket; it will open automatically."
     )
     selected_candidate_index = st.selectbox(
         "Choose the course report",
         options=range(len(candidates)),
+        index=None,
+        placeholder="Select a course report",
         format_func=lambda index: candidates[index]["archive_path"],
         key=f"github-report-file-{candidate_key}",
     )
-    if st.button(
-        "Load selected report and start review",
-        type="primary",
-        width="stretch",
-        key=f"github-load-report-{candidate_key}",
-    ):
-        candidate = candidates[selected_candidate_index]
-        try:
-            with st.spinner(f"Parsing {candidate['filename']}…"):
-                result = add_report_payload(
-                    candidate["filename"],
-                    candidate["payload"],
-                    {
-                        "jira_issue": issue,
-                        "jira_attachment_id": "",
-                        "github_run_url": selected_ref.web_url,
-                        "github_artifact_id": candidate["artifact_id"],
-                        "github_artifact_name": candidate["artifact_name"],
-                    },
-                )
-            st.session_state.github_report_candidates.pop(candidate_key, None)
-            activate_loaded_report(result)
-            st.rerun()
-        except (QAEngineError, UnicodeError, ValueError) as error:
-            st.error(str(error))
+    if selected_candidate_index is None:
+        return
+    candidate = candidates[selected_candidate_index]
+    try:
+        with st.spinner(f"Preparing {candidate['filename']}…"):
+            result = add_report_payload(
+                candidate["filename"],
+                candidate["payload"],
+                {
+                    "jira_issue": issue,
+                    "jira_attachment_id": "",
+                    "github_run_url": selected_ref.web_url,
+                    "github_artifact_id": candidate["artifact_id"],
+                    "github_artifact_name": candidate["artifact_name"],
+                },
+            )
+        st.session_state.github_report_candidates.pop(candidate_key, None)
+        activate_loaded_report(result)
+        st.rerun()
+    except (QAEngineError, UnicodeError, ValueError) as error:
+        st.session_state.github_report_errors[candidate_key] = str(error)
+        st.error(str(error))
 
 
 def render_jira_workspace(
@@ -1194,7 +1227,6 @@ def render_jira_workspace(
     configuration_error: str,
     user: UserIdentity,
 ) -> None:
-    del user
     st.markdown("### Step 1 · Open your Jira report")
     st.markdown(
         """
@@ -1421,7 +1453,7 @@ def render_jira_workspace(
         render_github_report_loader(
             issue,
             github_refs,
-            primary=not html_attachments,
+            user=user,
         )
 
     if st.session_state.reports:

@@ -253,8 +253,10 @@ repositories containing QA workflow runs. Grant only **Actions: Read-only**,
 authorize it for the Kiddom organization if SSO is enforced, and save it as
 `[github].token` or `GITHUB_TOKEN`. The token stays server-side. The app lists
 the run's non-expired artifacts, downloads the most likely QA artifact, and
-loads the Issue Annotation Report HTML. If one artifact contains multiple
-course reports, the reviewer chooses the report inside the app.
+loads the Issue Annotation Report HTML automatically when the Jira ticket is
+selected. There is no GitHub download or HTML upload step. If one artifact
+contains multiple course reports, the reviewer chooses the report inside the
+app and it opens immediately.
 
 `JIRA_TICKET_JQL` can replace the default
 `project + assignee + not-done` query. It supports `{account_id}` and
