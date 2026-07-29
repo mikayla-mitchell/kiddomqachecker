@@ -141,6 +141,59 @@ def test_user_and_assigned_ticket_search_use_current_cloud_endpoints():
     assert 'assignee = "reviewer-1"' in search_call[2]["json"]["jql"]
 
 
+def test_google_identity_resolves_to_exact_jira_user():
+    session = FakeSession(
+        [
+            FakeResponse(
+                data=[
+                    {
+                        "accountId": "reviewer-1",
+                        "displayName": "Mikayla Mitchell",
+                        "emailAddress": "mikayla@kiddom.co",
+                        "active": True,
+                    },
+                    {
+                        "accountId": "reviewer-2",
+                        "displayName": "Mikayla M.",
+                        "emailAddress": "other@kiddom.co",
+                        "active": True,
+                    },
+                ]
+            )
+        ]
+    )
+    reviewer = JiraClient(config(), session=session).find_user_for_identity(
+        "mikayla@kiddom.co", "Mikayla Mitchell"
+    )
+    assert reviewer["account_id"] == "reviewer-1"
+
+
+def test_ambiguous_google_identity_requires_admin_mapping():
+    session = FakeSession(
+        [
+            FakeResponse(
+                data=[
+                    {
+                        "accountId": "one",
+                        "displayName": "Same Person",
+                        "active": True,
+                    },
+                    {
+                        "accountId": "two",
+                        "displayName": "Same Person",
+                        "active": True,
+                    },
+                ]
+            ),
+            FakeResponse(data=[]),
+        ]
+    )
+    with pytest.raises(JiraIntegrationError, match="jira_user_map"):
+        JiraClient(config(), session=session).find_user_for_identity(
+            "hidden@kiddom.co", "Same Person"
+        )
+
+
 def test_html_attachment_detection_and_authenticated_download():
     attachment = {
         "id": "9001",

@@ -8,6 +8,7 @@ from decision_memory import (
     initialize_memory,
     issue_signature,
     library_stats,
+    list_report_review_activity,
     list_report_library,
     load_draft_reviews,
     load_report_jira_link,
@@ -15,6 +16,7 @@ from decision_memory import (
     match_report_rows,
     memory_stats,
     publish_report_reviews,
+    record_review_events,
     report_similarity,
     save_draft_reviews,
     save_report_jira_link,
@@ -372,6 +374,7 @@ def test_full_shared_memory_export_import_round_trip(tmp_path):
         "reports": 1,
         "findings": 1,
         "drafts": 1,
+        "events": 0,
     }
     assert library_stats(target_database)["reports"] == 1
     assert load_report_snapshot(target_database, "report-a")["records"][0][
@@ -399,4 +402,42 @@ def test_schema_one_database_migrates_in_place(tmp_path):
         version = connection.execute(
             "SELECT value FROM metadata WHERE key='schema_version'"
         ).fetchone()[0]
-    assert version == "2"
+    assert version == "3"
+
+
+def test_reviewer_activity_is_separate_and_portable(tmp_path):
+    source_database = tmp_path / "source.sqlite3"
+    target_database = tmp_path / "target.sqlite3"
+    row = review_row("issue-1")
+    store_report_snapshot(
+        source_database,
+        "report-a",
+        "Course A",
+        "course-a.html",
+        [row],
+        [row],
+        "test",
+    )
+    assert record_review_events(
+        source_database,
+        "report-a",
+        "save_decisions",
+        {"email": "reviewer@kiddom.co", "name": "Reviewer"},
+        [
+            {
+                "issue_id": "issue-1",
+                "decision": "rejected",
+                "detail": {"review_note": "Valid curriculum term"},
+            }
+        ],
+    ) == 1
+    activity = list_report_review_activity(source_database, "report-a")
+    assert activity[0]["reviewer_email"] == "reviewer@kiddom.co"
+    assert activity[0]["detail"]["review_note"] == "Valid curriculum term"
+
+    result = import_memory_bytes(
+        target_database, export_memory_bytes(source_database)
+    )
+    assert result["events"] == 1
+    imported = list_report_review_activity(target_database, "report-a")
+    assert imported[0]["action"] == "save_decisions"
