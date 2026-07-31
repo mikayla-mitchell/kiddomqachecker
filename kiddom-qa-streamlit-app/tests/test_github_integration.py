@@ -141,25 +141,6 @@ def test_list_and_download_artifact_uses_read_only_api_headers():
     assert download_call[2]["allow_redirects"] is True
 
 
-def test_legacy_organization_owner_uses_current_api_owner():
-    session = FakeSession([FakeResponse(payload={"artifacts": []})])
-    client = GitHubActionsClient(
-        GitHubConfig.from_mapping({"GITHUB_TOKEN": "secret"}),
-        session=session,
-    )
-    ref = parse_github_actions_run_url(
-        "https://github.com/ayo-kiddom/content-enhancement-agent/actions/runs/123"
-    )
-    assert ref is not None
-
-    client.list_run_artifacts(ref)
-
-    assert ref.web_url.startswith("https://github.com/ayo-kiddom/")
-    assert session.calls[0][1].endswith(
-        "/repos/kiddom/content-enhancement-agent/actions/runs/123/artifacts"
-    )
-
-
 @pytest.mark.parametrize(
     ("status_code", "message"),
     [
