@@ -17,6 +17,11 @@ RUN_PATH_RE = re.compile(
     re.I,
 )
 REPORT_MARKERS = (b"issue-card", b"aggregated-issue")
+GITHUB_OWNER_ALIASES = {
+    # Jira tickets created before the organization rename still contain the
+    # legacy owner. Fine-grained tokens are scoped to the current owner.
+    "ayo-kiddom": "kiddom",
+}
 
 
 class GitHubIntegrationError(RuntimeError):
@@ -89,6 +94,10 @@ class GitHubRunRef:
     def label(self) -> str:
         return f"{self.owner}/{self.repo} · run {self.run_id}"
 
+    @property
+    def api_owner(self) -> str:
+        return GITHUB_OWNER_ALIASES.get(self.owner.casefold(), self.owner)
+
 
 def parse_github_actions_run_url(url: str) -> GitHubRunRef | None:
     parsed = urlparse(str(url or "").strip())
@@ -159,11 +168,22 @@ class GitHubActionsClient:
                 f"GitHub could not be reached: {error.__class__.__name__}."
             ) from error
         if response.status_code not in expected:
-            if response.status_code in {401, 403, 404}:
+            if response.status_code == 401:
                 raise GitHubIntegrationError(
-                    "GitHub could not access this workflow run. Confirm the "
-                    "token can read Actions artifacts for the repository and "
-                    "is authorized for the Kiddom organization."
+                    "GitHub rejected the token saved in Streamlit. Replace "
+                    "the [github] token secret, save, and reboot the app."
+                )
+            if response.status_code == 403:
+                raise GitHubIntegrationError(
+                    "GitHub accepted the token but denied this request. "
+                    "Confirm it has Actions: read access to "
+                    "kiddom/content-enhancement-agent."
+                )
+            if response.status_code == 404:
+                raise GitHubIntegrationError(
+                    "GitHub could not find this workflow run using the saved "
+                    "token. Confirm the run still exists and the token can "
+                    "access kiddom/content-enhancement-agent."
                 )
             if response.status_code == 410:
                 raise GitHubIntegrationError(
@@ -176,7 +196,7 @@ class GitHubActionsClient:
 
     def list_run_artifacts(self, ref: GitHubRunRef) -> list[dict[str, Any]]:
         path = (
-            f"/repos/{quote(ref.owner, safe='')}/{quote(ref.repo, safe='')}"
+            f"/repos/{quote(ref.api_owner, safe='')}/{quote(ref.repo, safe='')}"
             f"/actions/runs/{quote(ref.run_id, safe='')}/artifacts"
         )
         response = self._request(
@@ -211,7 +231,7 @@ class GitHubActionsClient:
 
     def download_artifact(self, ref: GitHubRunRef, artifact_id: str) -> bytes:
         path = (
-            f"/repos/{quote(ref.owner, safe='')}/{quote(ref.repo, safe='')}"
+            f"/repos/{quote(ref.api_owner, safe='')}/{quote(ref.repo, safe='')}"
             f"/actions/artifacts/{quote(str(artifact_id), safe='')}/zip"
         )
         response = self._request(
